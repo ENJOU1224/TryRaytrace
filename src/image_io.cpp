@@ -7,8 +7,8 @@
 #include <omp.h> // 需要 OpenMP 加速转换
 
 void save_snapshot(const Vec* h_accum, int w, int h, int frame, float focus_dist, float aperture) {
-    // 1. 确保 log 目录存在
-    (void)system("mkdir -p log");
+    // 1. 确保 logs 目录存在
+    (void)system("mkdir -p logs");
 
     // 2. 生成文件名
     std::time_t now = std::time(nullptr);
@@ -17,7 +17,7 @@ void save_snapshot(const Vec* h_accum, int w, int h, int frame, float focus_dist
     std::strftime(time_str, sizeof(time_str), "%Y-%m-%d_%H-%M-%S", t);
 
     char filename[256];
-    sprintf(filename, "log/%s_Frame%d.ppm", time_str, frame);
+    sprintf(filename, "logs/%s_Frame%d.ppm", time_str, frame);
 
     // 3. 转换数据 (OpenMP 加速)
     // 这里分配临时内存，用完即焚

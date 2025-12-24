@@ -1,4 +1,4 @@
 *.o
-log
+logs
 *.jpg
 cuda_engine

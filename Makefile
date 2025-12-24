@@ -1,57 +1,77 @@
 # =============================================================================
-# Modern High-Performance CUDA Makefile
+# Project Configuration
 # =============================================================================
 
-# 1. 编译器设置
-# 使用系统默认编译器 (g++)，开启针对本机 CPU 的所有优化指令集 (AVX2/FMA等)
+# 目录定义
+SRC_DIR = src
+OBJ_DIR = bin
+# 资源目录 (运行时需要，这里只用于标记)
+ASSET_DIR = assets
+
+# 目标文件
+TARGET = $(OBJ_DIR)/cuda_engine
+
+# 源文件列表 (手动列出，或者用 wildcard 通配符)
+# 这里为了清晰，我们手动列出对象名，Make 会自动去 src 找对应的 cpp/cu
+OBJS_NAMES = renderer.o pipeline.o camera.o scene.o loader.o input.o image_io.o main.o
+# 给所有对象加上 bin/ 前缀
+OBJS = $(addprefix $(OBJ_DIR)/, $(OBJS_NAMES))
+
+# =============================================================================
+# Compiler Settings
+# =============================================================================
+
+# Host Compiler
 CXX = g++
-CXXFLAGS = -O3 -march=native -fopenmp -Wall -Wno-unknown-pragmas
+# -I$(SRC_DIR): 告诉编译器头文件在 src 目录里
+CXXFLAGS = -O3 -march=native -fopenmp -Wall -Wno-unknown-pragmas -I$(SRC_DIR)
 
-# NVCC 设置 (不再需要 -ccbin g++-11)
+# Device Compiler
 NVCC = nvcc
-# 你的显卡架构 (1660 Ti = Turing = sm_75)
 ARCH = -arch=sm_75
-# 如果还是偶发头文件冲突，保留这个宏作为保险；如果不用也能跑，可以删掉 COMPAT_FLAGS
 COMPAT_FLAGS = -D_AMXTILEINTRIN_H_INCLUDED -D_AMXINT8INTRIN_H_INCLUDED -D_AMXBF16INTRIN_H_INCLUDED -D_AVX512BF16VLINTRIN_H_INCLUDED -D_AVX512BF16INTRIN_H_INCLUDED
-NVCC_FLAGS = -O3 $(ARCH) --use_fast_math $(COMPAT_FLAGS)
+# 同样需要 -I$(SRC_DIR)
+NVCC_FLAGS = -O3 $(ARCH) --use_fast_math $(COMPAT_FLAGS) -I$(SRC_DIR)
 
-# 2. 路径设置
-# 告诉 g++ 去哪里找 CUDA 头文件 (根据你的系统调整，通常在 /usr/local/cuda/include)
-CUDA_INC = -I/usr/local/cuda/include -I/usr/lib/nvidia-cuda-toolkit/include
-
-# 3. 链接设置
+# Linker Flags
 LDFLAGS = -lSDL2 -lgomp -Xcompiler -fopenmp
 
-# 4. 文件列表
-TARGET = cuda_engine
-OBJS = renderer.o pipeline.o camera.o scene.o loader.o input.o image_io.o main.o
+# CUDA Include Path (根据你的环境调整)
+CUDA_INC = -I/usr/local/cuda/include -I/usr/lib/nvidia-cuda-toolkit/include
 
 # =============================================================================
-# 构建规则
+# Build Rules
 # =============================================================================
 
-all: $(TARGET)
+# 默认目标
+all: dir $(TARGET)
+
+# 创建 bin 目录
+dir:
+	@mkdir -p $(OBJ_DIR)
 
 # 链接
 $(TARGET): $(OBJS)
-	$(NVCC) $(OBJS) -o $(TARGET) $(LDFLAGS)
+	@echo "Linking $@"
+	@$(NVCC) $(OBJS) -o $(TARGET) $(LDFLAGS)
 
-# 编译 C++ 源代码 (.cpp) -> Host Code
-# 使用 CXX (g++) 编译，享受 AVX2 加速
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) $(CUDA_INC) -c $< -o $@
+# 编译 C++ (.cpp -> .o)
+# $< 是源文件 (src/xxx.cpp), $@ 是目标文件 (bin/xxx.o)
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
+	@echo "Compiling C++ $<"
+	@$(CXX) $(CXXFLAGS) $(CUDA_INC) -c $< -o $@
 
-# 编译 CUDA 源代码 (.cu) -> Device Code
-# 使用 NVCC 编译
-%.o: %.cu
-	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+# 编译 CUDA (.cu -> .o)
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu
+	@echo "Compiling CUDA $<"
+	@$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+# 运行 (方便调试)
+run: all
+	./$(TARGET)
 
 # 清理
 clean:
-	rm -f $(TARGET) *.o
+	rm -rf $(OBJ_DIR)
 
-run:all
-	./cuda_engine
-
-# 伪目标
-.PHONY: all clean run
+.PHONY: all dir clean run

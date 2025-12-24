@@ -9,7 +9,7 @@
 // ======================================================================================
 Scene create_cornell_box() {
     Scene scene;
-    scene.texture_files.push_back("earth.ppm");
+    scene.texture_files.push_back("assets/earth.ppm");
 
     Vec white = {0.75f, 0.75f, 0.75f};
     Vec red   = {0.75f, 0.25f, 0.25f};
@@ -28,7 +28,7 @@ Scene create_cornell_box() {
     // --- 2. 外部模型 (立方体) ---
     // 我们把 cube.obj 加载进来，放在空中，稍微旋转一点(这里没写旋转逻辑，只是放个位置)
     // 参数: 文件名, 目标数组, 位置偏移, 缩放大小, 颜色, 材质
-    load_obj("cube.obj", scene.objects, 
+    load_obj("assets/cube.obj", scene.objects, 
              {50, 10,190},  // 位置 (左边空中)
              10.0f,         // 缩放 (变大10倍，因为原始坐标是1.0)
              gold,          // 金色
