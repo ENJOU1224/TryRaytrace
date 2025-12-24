@@ -6,7 +6,7 @@ LDFLAGS = -lSDL2 -lgomp -Xcompiler -fopenmp
 
 TARGET = cuda_engine
 # 所有的 .o 文件
-OBJS = renderer.o pipeline.o camera.o scene.o main.o
+OBJS = loader.o renderer.o pipeline.o camera.o scene.o main.o
 
 all: $(TARGET)
 
