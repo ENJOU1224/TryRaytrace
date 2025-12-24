@@ -18,8 +18,9 @@ enum Refl_t {
 // [形状类型]
 // 决定使用哪个数学公式来计算光线交点
 enum Shape_t { 
-    SPHERE, // 球体: (p - c)^2 = r^2
-    PLANE   // 平面: n · p = d
+    SPHERE,   // 球体: (p - c)^2 = r^2
+    TRIANGLE, // 三角形
+    PLANE     // 平面: n · p = d
 };
 
 // ======================================================================================
@@ -45,13 +46,23 @@ enum Shape_t {
 // 总大小: 80 字节/对象。
 // 即使有填充浪费，但保证了 GPU 读取 Vec 时总是对齐的 (Coalesced Access)，性能最高。
 struct Object {
-    float rad;    // [复用]: 球体半径 Radius | 平面常数 Offset D
-    Vec p;        // [复用]: 球体球心 Position | 平面法线 Normal
-    Vec e;        // [自发光]: Emission Color (RGB)
-    Vec c;        // [颜色]: Surface Color (RGB)
-    Refl_t refl;  // [材质]: Diffuse, Specular, Refractive
-    Shape_t type; // [形状]: Sphere, Plane
-    int tex_id;   // [纹理] 纹理 ID (-1:无纹理, 0:第一张图...)
+    // --- 通用属性 ---
+    Refl_t refl;  
+    Shape_t type;
+    int tex_id;
+    float padding; // 凑 16 字节对齐
+
+    // --- 材质属性 ---
+    Vec color;    // 表面颜色
+    Vec emission; // 自发光
+
+    // --- 几何属性 (Union 可能会导致问题，直接铺开写) ---
+    // [球体/平面 用]
+    float rad; 
+    Vec pos;   // 球心 或 平面法线
+
+    // [三角形 用]
+    Vec v0, v1, v2; 
 };
 
 // ======================================================================================
@@ -60,7 +71,7 @@ struct Object {
 
 // 场景中物体的总数 (6面墙 + 2球 + 1灯)
 // 这个宏会在 renderer.cu 的循环展开 (#pragma unroll) 中用到，必须是编译期常量。
-#define NUM_OBJECTS 9
+#define NUM_OBJECTS 256
 
 // 相机参数包 (传给 GPU 用的)
 struct CameraParams {

@@ -164,12 +164,43 @@ __device__ float intersect(const Object& obj, const Vec& r_o, const Vec& r_d) {
     float eps = 1e-4f; // 极小值，用于消除浮点误差带来的"自我遮挡"
     
     // 分支 1: 平面求交
-    if (obj.type == PLANE) {
+    if (obj.type == TRIANGLE) {
+        // [Möller–Trumbore 算法]
+        // 1. 计算两边向量 (可以在初始化时算好存起来，这里为了简单现场算)
+        Vec e1 = obj.v1 - obj.v0;
+        Vec e2 = obj.v2 - obj.v0;
+        
+        // 2. 计算行列式
+        Vec h = r_d.cross(e2);
+        float a = e1.dot(h);
+        
+        // 如果 a 接近 0，说明光线平行于三角形，没打中
+        if (a > -eps && a < eps) return 0.0f;
+        
+        float f = 1.0f / a;
+        Vec s = r_o - obj.v0;
+        float u = f * s.dot(h);
+        
+        // 检查重心坐标 u 范围
+        if (u < 0.0f || u > 1.0f) return 0.0f;
+        
+        Vec q = s.cross(e1);
+        float v = f * r_d.dot(q);
+        
+        // 检查重心坐标 v 范围
+        if (v < 0.0f || u + v > 1.0f) return 0.0f;
+        
+        // 3. 计算 t (距离)
+        float t = f * e2.dot(q);
+        
+        if (t > eps) return t;
+        else return 0.0f;
+    }else if (obj.type == PLANE) {
         // 公式: t = (D - N·O) / (N·D)
-        float denom = obj.p.dot(r_d);
+        float denom = obj.pos.dot(r_d);
         // fabsf: 浮点绝对值。如果分母太小，说明光线平行于平面，打不中。
         if (fabsf(denom) > 1e-6f) {
-            float t = (obj.rad - obj.p.dot(r_o)) / denom;
+            float t = (obj.rad - obj.pos.dot(r_o)) / denom;
             return (t > eps) ? t : 0.0f; // 只返回正前方的交点
         }
         return 0.0f;
@@ -177,7 +208,7 @@ __device__ float intersect(const Object& obj, const Vec& r_o, const Vec& r_d) {
     // 分支 2: 球体求交
     else {
         // 求解一元二次方程: at^2 + bt + c = 0
-        Vec op = obj.p - r_o;
+        Vec op = obj.pos - r_o;
         float b = op.dot(r_d);
         float det = b * b - op.dot(op) + obj.rad * obj.rad;
         
@@ -295,9 +326,19 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
 
         const Object& obj = d_objects[id];
         Vec x_hit = r_o + r_d * d_min; // 交点
-        Vec n = (obj.type == PLANE) ? obj.p : (x_hit - obj.p).norm(); // 法线
+        Vec n;
+        if (obj.type == SPHERE) {
+            n = (x_hit - obj.pos).norm();
+        } else if (obj.type == PLANE) {
+            n = obj.pos; // 这里的 pos 存的是法线
+        } else if (obj.type == TRIANGLE) {
+            // 三角形法线 = 两边叉积
+            Vec e1 = obj.v1 - obj.v0;
+            Vec e2 = obj.v2 - obj.v0;
+            n = e1.cross(e2).norm();
+        }
         Vec nl = n.dot(r_d) < 0 ? n : n * -1; // 确保法线朝向光线来的一侧
-        Vec f = obj.c; // 物体颜色
+        Vec f = obj.color; // 物体颜色
                        
         // [新增] 纹理采样逻辑 (UV Mapping)
         if (obj.tex_id >= 0) {
@@ -305,7 +346,7 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
             
             // --- 情况 A: 球体 (地球仪) ---
             if (obj.type == SPHERE) {
-                Vec p = (x_hit - obj.p).norm(); 
+                Vec p = (x_hit - obj.pos).norm(); 
                 float phi = atan2f(p.z, p.x);
                 float theta = asinf(p.y);
                 u = 1.0f - (phi + M_PI) / (2.0f * M_PI);
@@ -355,7 +396,7 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         }
 
         // 累加自发光 (如果是灯，e > 0; 如果是墙，e = 0)
-        radiance = radiance + throughput.mult(obj.e);
+        radiance = radiance + throughput.mult(obj.emission);
         
         // [俄罗斯轮盘赌]: 概率性终止光线
         // 目的: 减少深层递归的计算量。如果 throughput 已经很黑了，没必要算了。

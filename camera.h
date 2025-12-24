@@ -1,27 +1,41 @@
 #pragma once
 #include "common.h"
-#include "scene.h" // 需要 CameraParams 定义
+#include "scene.h"
 
 class CameraController {
 public:
-    // 构造函数：设置初始位置和朝向
-    CameraController(Vec position, Vec direction);
+    CameraController(Vec position, Vec look_at);
 
-    // 处理输入，返回 true 如果相机动了
+    // [修改] update 现在只处理键盘移动
+    // 返回 true 表示位置改变了
     bool update(float delta_time);
 
-    // 获取传给 GPU 的参数包
-    CameraParams get_params(int width, int height);
+    // [新增] 处理鼠标移动
+    // xrel, yrel: 鼠标在 X/Y 轴的相对位移
+    // 返回 true 表示视角改变了
+    bool process_mouse(float xrel, float yrel);
 
-    // [新增] 获取当前参数用于文件名
+    CameraParams get_params(int width, int height);
+    
+    // [新增] 获取参数用于调试
     float get_aperture() const { return aperture; }
     float get_focus_dist() const { return focus_dist; }
 
 private:
-    Vec pos;
-    Vec dir;
-    float speed = 2.5f;
+    void update_camera_vectors(); // 根据 Yaw/Pitch 计算 dir, right, up
 
-    float aperture = 0.0f;     // 初始光圈 (0=无景深)
-    float focus_dist = 240.0f; // 初始对焦距离 (大概在玻璃球的位置)
+    Vec pos;
+    Vec dir;   // 前方
+    Vec right; // 右方 (用于 A/D 移动)
+    Vec up;    // 上方 (用于 Q/E 移动)
+
+    // 欧拉角
+    float yaw = -90.0f; // 初始看向 -Z 方向
+    float pitch = 0.0f;
+    
+    float move_speed = 2.5f;
+    float mouse_sensitivity = 0.1f; // 鼠标灵敏度
+
+    float aperture = 0.0f;
+    float focus_dist = 240.0f;
 };
