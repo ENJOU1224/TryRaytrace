@@ -1,41 +1,83 @@
-#pragma once
-#include "common.h"
-#include "scene.h"
+#pragma once // [C++预处理] 防止头文件重复包含
 
+#include "common.h" // 需要 Vec 结构体
+#include "scene.h"  // 需要 CameraParams 结构体定义
+
+// ======================================================================================
+// 类: CameraController (相机控制器)
+// ======================================================================================
+// [设计意图]
+// 这是一个纯 CPU 端的类，负责管理相机的"状态"。
+// 它就像一个飞行员，根据键盘鼠标输入，计算出飞机的当前姿态(位置、朝向)。
+// 最后通过 get_params() 打包数据发送给 GPU 去渲染。
+// ======================================================================================
 class CameraController {
 public:
+    // [构造函数]
+    // position: 初始位置
+    // look_at:  初始看向的点 (或者初始朝向向量，取决于实现)
     CameraController(Vec position, Vec look_at);
 
-    // [修改] update 现在只处理键盘移动
-    // 返回 true 表示位置改变了
+    // ------------------------------------------------------------------
+    // 输入处理接口
+    // ------------------------------------------------------------------
+
+    // [键盘移动]
+    // 处理 W/A/S/D/Q/E 按键，更新相机位置 (pos)。
+    // 参数 delta_time: 距离上一帧经过的时间 (用于保证移动速度均匀)，目前暂时传 1.0。
+    // 返回值: true 表示相机动了 (需要重置渲染)，false 表示没动。
     bool update(float delta_time);
 
-    // [新增] 处理鼠标移动
-    // xrel, yrel: 鼠标在 X/Y 轴的相对位移
-    // 返回 true 表示视角改变了
+    // [鼠标旋转]
+    // 处理鼠标移动，更新相机角度 (yaw/pitch)。
+    // xrel: 鼠标水平移动距离 (控制左右转)
+    // yrel: 鼠标垂直移动距离 (控制抬头低头)
     bool process_mouse(float xrel, float yrel);
 
+    // ------------------------------------------------------------------
+    // 数据传输接口
+    // ------------------------------------------------------------------
+
+    // [打包参数]
+    // 将类内部复杂的欧拉角、位置、光圈等状态，
+    // 转换成 GPU 渲染内核(Kernel)能直接使用的纯数据结构 (CameraParams)。
+    // 这一步涉及坐标系的基底向量计算 (cx, cy)。
     CameraParams get_params(int width, int height);
     
-    // [新增] 获取参数用于调试
+    // [调试接口] 获取当前物理参数
     float get_aperture() const { return aperture; }
     float get_focus_dist() const { return focus_dist; }
 
 private:
-    void update_camera_vectors(); // 根据 Yaw/Pitch 计算 dir, right, up
+    // [内部函数] 更新相机向量
+    // 根据当前的 Yaw(偏航角) 和 Pitch(俯仰角)，
+    // 重新计算出 dir(前), right(右), up(上) 三个正交向量。
+    void update_camera_vectors(); 
 
-    Vec pos;
-    Vec dir;   // 前方
-    Vec right; // 右方 (用于 A/D 移动)
-    Vec up;    // 上方 (用于 Q/E 移动)
+    // --- 空间状态 ---
+    Vec pos;   // 摄像机在世界坐标系中的绝对位置
+    
+    // [相机坐标系基底 (Orthonormal Basis)]
+    // 这三个向量互相垂直，定义了相机的"局部空间"。
+    Vec dir;   // Front: 镜头指向哪里 (Z轴)
+    Vec right; // Right: 镜头的右边在哪里 (X轴) - 用于 A/D 平移
+    Vec up;    // Up:    镜头的头顶在哪里 (Y轴) - 用于 Q/E 垂直升降
 
-    // 欧拉角
-    float yaw = -90.0f; // 初始看向 -Z 方向
+    // --- 旋转状态 (欧拉角) ---
+    // Yaw (偏航角): 绕 Y 轴旋转 (左右摇头)。
+    //   -90.0f 是因为在数学上，0度通常指向 X 轴正方向。
+    //   我们要让相机默认看向 Z 轴负方向 (屏幕里)，所以需要转 -90 度。
+    float yaw = -90.0f; 
+    
+    // Pitch (俯仰角): 绕 X 轴旋转 (上下点头)。
+    //   范围限制在 -89.0 到 89.0 度，防止"万向节死锁" (看天花板看过了头)。
     float pitch = 0.0f;
     
-    float move_speed = 2.5f;
-    float mouse_sensitivity = 0.1f; // 鼠标灵敏度
+    // --- 控制参数 ---
+    float move_speed = 2.5f;        // 键盘移动速度
+    float mouse_sensitivity = 0.1f; // 鼠标灵敏度 (度/像素)
 
-    float aperture = 0.0f;
-    float focus_dist = 240.0f;
+    // --- 光学参数 (物理相机) ---
+    float aperture = 0.0f;      // 光圈直径 (0 = 针孔相机/全清晰; 值越大背景越虚化)
+    float focus_dist = 240.0f;  // 对焦距离 (相机到清晰平面的距离)
 };

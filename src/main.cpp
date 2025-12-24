@@ -6,7 +6,7 @@
  * 职责:
  * 1. 资源管理: 初始化窗口、显存、内存、各个子模块 (Scene, Camera, Pipeline)。
  * 2. 主循环调度: 协调 GPU 计算与 CPU 后处理，实现"双缓冲流水线"并行。
- * 3. 交互逻辑: 处理用户输入 (WASD 漫游)，控制渲染状态 (累积/重置)。
+ * 3. 交互逻辑: 通过 InputManager 处理用户输入，控制渲染状态。
  * 
  * 架构视角:
  * [Input] -> [Camera] -> [Renderer(GPU)] -> [VRAM Snapshot] -> [Pipeline(CPU)] -> [Display]
@@ -23,11 +23,8 @@
 #include "camera.h"     // 相机控制逻辑
 #include "renderer.h"   // GPU 渲染接口
 #include "pipeline.h"   // CPU 后台处理流水线
-#include <csignal> // [新增] 信号处理库
-#include <ctime>   // [新增] 时间库
-#include <iomanip> // [新增] 格式化输出
-#include "input.h"    // [新]
-#include "image_io.h" // [新]
+#include "input.h"      // 输入管理
+#include "image_io.h"   // 文件保存
 
 // ======================================================================================
 // 主函数入口
@@ -56,7 +53,7 @@ int main(int argc, char** argv) {
     // 创建渲染器 (Renderer) - 这里指的是 SDL 的 2D 绘图器，利用硬件加速
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     
-    // 创建纹理 (Texture) - 显存中的一块像素缓冲区，用于最终上屏显示
+    // 创建纹理 (Texture) - 显存中的一块像素缓冲区，用于存放最终上屏显示
     // SDL_TEXTUREACCESS_STREAMING: 标记这块纹理会被频繁修改 (每帧更新)
     SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
 
@@ -110,23 +107,25 @@ int main(int argc, char** argv) {
     Pipeline pipe;
     pipeline_init(&pipe, h_accum, d_staging, pixel_buffer, w, h);
 
+    // [输入模块]: 接管键盘鼠标
+    // 构造函数里会自动调用 SDL_SetRelativeMouseMode(SDL_TRUE)
+    InputManager input; 
+
     // ------------------------------------------------------------------
     // 5. 游戏主循环 (Game Loop)
     // ------------------------------------------------------------------
-
-    InputManager input;// 输入管理器
-                       
+    
     int gpu_frame = 1; // 当前 GPU 正在累积第几帧
     bool quit = false;
 
-    SDL_SetRelativeMouseMode(SDL_TRUE);
-
     while (!quit) {
-      InputState state = input.process_events(cam);
+        
+        // --- 步骤 A: 输入处理 (Input) ---
+        // 所有的 SDL 事件轮询和键盘状态检查都在这里完成
+        InputState state = input.process_events(cam);
 
-      if (state.quit) quit = true;
-        // 更新相机位置 (假设每帧 delta_time 为 1.0)
-        // update() 内部会检测键盘 WASD 状态
+        // 处理退出信号
+        if (state.quit) quit = true;
 
         // [关键逻辑]: 累积重置 (Accumulation Reset)
         // 如果相机动了，之前的累积结果就作废了(画面变了)，必须清空重算。
@@ -136,9 +135,9 @@ int main(int argc, char** argv) {
             cudaMemset(d_accum, 0, size_bytes); // 异步清零，速度极快
         }
 
+        // 处理保存请求 (按下 'P' 键)
         if (state.save_request) {
             // 保存快照 (使用 h_accum，它是最近一次同步到 CPU 的帧)
-            // 注意：h_accum 的内容可能滞后于 gpu_frame 一两帧，但这在静态画面下无所谓
             save_snapshot(h_accum, w, h, gpu_frame, cam.get_focus_dist(), cam.get_aperture()); 
         }
 
