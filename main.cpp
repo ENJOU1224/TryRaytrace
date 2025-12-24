@@ -26,67 +26,13 @@
 #include <csignal> // [新增] 信号处理库
 #include <ctime>   // [新增] 时间库
 #include <iomanip> // [新增] 格式化输出
-
-// ======================================================================================
-// 全局信号标志
-// ======================================================================================
-// volatile sig_atomic_t 保证在信号处理函数中修改变量是安全的
-volatile sig_atomic_t g_signal_received = 0;
-
-void handle_sigint(int sig) {
-    g_signal_received = 1;
-}
-
-// ======================================================================================
-// 快照保存函数
-// ======================================================================================
-void save_snapshot(Vec* h_accum, int w, int h, int frame, float focus, float aperture) {
-    // 1. 获取当前时间字符串
-    std::time_t now = std::time(nullptr);
-    std::tm* t = std::localtime(&now);
-    char time_str[64];
-    std::strftime(time_str, sizeof(time_str), "%Y-%m-%d_%H-%M-%S", t);
-
-    // 2. 生成文件名
-    char filename[256];
-    sprintf(filename, "log/%s_Frame%d_Focus%.1f_Aperture%.1f.ppm", 
-            time_str, frame, focus, aperture);
-
-    // 3. 准备数据 (从高精度累加数据转换)
-    unsigned char* img = (unsigned char*)malloc(w * h * 3);
-    
-    #pragma omp parallel for
-    for (int i = 0; i < w * h; i++) {
-        Vec avg = h_accum[i] * (1.0f / frame);
-        img[i * 3 + 0] = (unsigned char)toInt(avg.x);
-        img[i * 3 + 1] = (unsigned char)toInt(avg.y);
-        img[i * 3 + 2] = (unsigned char)toInt(avg.z);
-    }
-
-    // 4. 写入文件
-    FILE* f = fopen(filename, "wb");
-    if (f) {
-        fprintf(f, "P6\n%d %d\n%d\n", w, h, 255);
-        fwrite(img, 1, w * h * 3, f);
-        fclose(f);
-        printf("\n[Snapshot] Image saved to: %s\n", filename);
-    } else {
-        printf("\n[Error] Failed to save snapshot!\n");
-    }
-
-    free(img);
-}
+#include "input.h"    // [新]
+#include "image_io.h" // [新]
 
 // ======================================================================================
 // 主函数入口
 // ======================================================================================
 int main(int argc, char** argv) {
-    // [新增] 注册 Ctrl+C 信号处理
-    signal(SIGINT, handle_sigint);
-
-    // [新增] 创建 log 文件夹
-    (void)system("mkdir -p log");
-
     // ------------------------------------------------------------------
     // 1. 系统配置
     // ------------------------------------------------------------------
@@ -101,7 +47,7 @@ int main(int argc, char** argv) {
 
     // 创建窗口 (Window)
     SDL_Window* window = SDL_CreateWindow(
-        "CUDA RayTracing Engine (Modular)", 
+        "CUDA Engine", 
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 
         w, h, 
         SDL_WINDOW_SHOWN
@@ -167,42 +113,33 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     // 5. 游戏主循环 (Game Loop)
     // ------------------------------------------------------------------
-    SDL_Event e;
+
+    InputManager input;// 输入管理器
+                       
     int gpu_frame = 1; // 当前 GPU 正在累积第几帧
     bool quit = false;
 
-    while (!quit) {
-        // [新增] 检查 Ctrl+C
-        if (g_signal_received) quit = true;
+    SDL_SetRelativeMouseMode(SDL_TRUE);
 
-        // --- 1. 事件处理 (包含按键截图) ---
-        while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_QUIT) quit = true;
-            
-            // [新增] 监听键盘按下事件
-            if (e.type == SDL_KEYDOWN) {
-                // 如果按下 'P' 键
-                // 按 ESC 退出
-                if (e.key.keysym.sym == SDLK_ESCAPE) {
-                    quit = true;
-                    printf("\n[System] Saving snapshot...");
-                    // 保存当前内存里最新的那帧数据 (h_accum)
-                    // 注意：h_accum 是 Worker 上一次搬运过来的，可能比 gpu_frame 滞后一点点，但这不影响截图
-                    save_snapshot(h_accum, w, h, gpu_frame, cam.get_focus_dist(), cam.get_aperture());
-                }
-            }
-        }
-        
+    while (!quit) {
+      InputState state = input.process_events(cam);
+
+      if (state.quit) quit = true;
         // 更新相机位置 (假设每帧 delta_time 为 1.0)
         // update() 内部会检测键盘 WASD 状态
-        bool camera_moved = cam.update(1.0f);
 
         // [关键逻辑]: 累积重置 (Accumulation Reset)
         // 如果相机动了，之前的累积结果就作废了(画面变了)，必须清空重算。
         // 如果相机没动，就继续在旧画面上叠加，让噪点越来越少。
-        if (camera_moved) {
+        if (state.camera_moved) {
             gpu_frame = 1;
             cudaMemset(d_accum, 0, size_bytes); // 异步清零，速度极快
+        }
+
+        if (state.save_request) {
+            // 保存快照 (使用 h_accum，它是最近一次同步到 CPU 的帧)
+            // 注意：h_accum 的内容可能滞后于 gpu_frame 一两帧，但这在静态画面下无所谓
+            save_snapshot(h_accum, w, h, gpu_frame, cam.get_focus_dist(), cam.get_aperture()); 
         }
 
         // --- 步骤 B: GPU 渲染 (Render Dispatch) ---
@@ -245,8 +182,8 @@ int main(int argc, char** argv) {
             // 更新窗口标题，显示状态
             if (gpu_frame % 10 == 0) {
                 char title[128];
-                sprintf(title, "CUDA Engine - Frame: %d %s", 
-                        gpu_frame, camera_moved ? "(Moving)" : "(Accumulating)");
+                sprintf(title, "Frame: %d | Focus: %.1f | Aperture: %.1f", 
+                        gpu_frame, cam.get_focus_dist(), cam.get_aperture());
                 SDL_SetWindowTitle(window, title);
             }
         }
