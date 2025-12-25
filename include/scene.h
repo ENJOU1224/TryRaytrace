@@ -1,4 +1,4 @@
-#pragma once 
+#pragma once
 #include "common.h" // 需要 Vec 定义
 #include <string>
 #include <vector>
@@ -9,81 +9,57 @@
 
 // [材质类型]
 // 影响光线反弹的行为 (BSDF)
-enum Refl_t { 
+enum Refl_t {
     DIFF, // 漫反射 (Diffuse): 朗伯余弦分布，模拟粗糙表面
     SPEC, // 镜面反射 (Specular): 完美反射，模拟镜子/金属
     REFR  // 折射 (Refractive): 斯涅尔定律 + 菲涅尔效应，模拟玻璃/水
 };
 
-// [几何体类型]
-// 影响光线求交的数学公式
-enum Shape_t {
-    SPHERE,   // 球体: 简单的解析几何求交，速度最快
-    TRIANGLE  // 三角形: Möller–Trumbore 算法，用于墙壁、模型等
-};
-
 // ======================================================================================
-// 2. 物体结构体 (Object) - 极致内存布局优化
+// 2. 物体结构体 (Object) - 纯三角形，极致优化
 // ======================================================================================
-// [优化策略]: 显存对齐 (Memory Alignment)
-// GPU 读取显存的最佳粒度是 128位 (16字节)。
-// 我们将所有 16字节对齐的 Vec 放在前面，将所有 4字节的标量 (float/int/enum) 放在最后凑整。
-// 
-// 这样排列后，Object 的大小正好是: 
-// 16*6 (Vec) + 4*4 (Scalar) = 112 字节。
-// 没有哪怕 1 个字节的 Padding 浪费！带宽利用率 100%。
+// [设计理念]:
+// - 只保留三角形，移除所有球体/平面支持
+// - 内存布局：96字节，完美16字节对齐（6×16）
+// - 无浪费，无分支，无类型标记
 // --------------------------------------------------------------------------------------
 struct Object {
-    // --- 16字节对齐的大块数据 (Vectors) ---
-    
-    // [三角形专用]
-    // 为了支持网格模型，我们需要存储三个顶点。
-    // 虽然球体和平面用不到这 48 字节，但为了保持 Object 大小统一以放入数组，这是必要的牺牲。
-    Vec v0, v1, v2; 
+    // --- 48字节：三角形顶点 (3×16) ---
+    Vec v0, v1, v2;
 
-    // [通用几何属性]
-    // 球体: 圆心位置 (Position)
-    // 平面: 法线向量 (Normal)
-    // 三角形: (未使用，法线在 Kernel 中通过 v0/v1/v2 实时计算)
-    Vec pos;   
-
-    // [材质属性]
-    Vec color;    // 表面基础颜色 (Albedo)
+    // --- 32字节：材质属性 (2×16) ---
+    Vec color;    // 表面颜色 (Albedo)
     Vec emission; // 自发光强度 (Light Source)
 
-    // --- 4字节的小块数据 (Scalars) ---
-    // 将它们凑在一起，刚好填满一个 16 字节的 Cache Line
-    
-    float rad;    // [复用]: 球体半径 Radius | 平面常数 D
-    int tex_id;   // [纹理]: -1 表示无纹理
-    float fuzz;   // [粗糙度]
-    float padding;// 4 [占位]
-                  
-    Refl_t refl;  // [材质]: 枚举本质上是 int (4字节)
-    Shape_t type; // [类型]: 枚举本质上是 int (4字节)
-    float pad2;   // 4
-    float pad3;   // 4
+    // --- 16字节：标量字段 (4×4) ---
+    int tex_id;   // 纹理ID (-1表示无纹理)
+    float fuzz;   // 粗糙度 (用于镜面反射)
+    Refl_t refl;  // 材质类型
+    int padding;  // 填充到96字节对齐
 };
+
+// 工厂函数：创建三角形
+inline Object make_triangle(Vec v0, Vec v1, Vec v2, Vec color, Refl_t refl,
+                            float fuzz = 0.0f, int tex_id = -1, Vec emission = {0,0,0}) {
+    return {v0, v1, v2, color, emission, tex_id, fuzz, refl, 0};
+}
 
 // ======================================================================================
 // 3. 全局配置与相机
 // ======================================================================================
 
 // [场景容量]
-// 定义 GPU 常量内存数组的大小。
-// 112 bytes * 256 ≈ 28 KB。
-// constant memory 上限通常是 64 KB，所以这里非常安全。
+// 96 bytes * 256 ≈ 24 KB。
+// constant memory 上限 64 KB，非常安全。
 #define NUM_OBJECTS 256
 
 // [相机参数]
-// 这个结构体在每一帧开始时由 CPU 传给 GPU Kernel。
-// 包含生成光线所需的所有几何信息。
 struct CameraParams {
     Vec pos; // 相机世界坐标
     Vec cx;  // 成像平面 X 轴 (已包含 FOV 缩放)
     Vec cy;  // 成像平面 Y 轴 (已包含 FOV 缩放)
     Vec dir; // 相机朝向 (归一化)
-    
+
     float lens_radius; // 光圈半径 (Aperture / 2)。0 为针孔相机。
     float focus_dist;  // 焦距。光线在何处汇聚。
 };
@@ -92,8 +68,6 @@ struct CameraParams {
 // 4. 场景管理接口
 // ======================================================================================
 
-// 这是一个纯 CPU 端的数据容器，负责管理资源的生命周期。
-// 使用 std::vector 可以方便地动态添加物体。
 struct Scene {
     std::vector<Object> objects;
     std::vector<std::string> texture_files;

@@ -86,19 +86,15 @@ void load_obj(const char* filename, std::vector<Object>& objects,
                 }
 
                 // [构建三角形对象]
-                // 使用 C++20 指定初始化器，清晰明了
-                objects.push_back({
-                    .v0 = v0, 
-                    .v1 = v1, 
-                    .v2 = v2,
-                    .pos = {0,0,0}, // 三角形不需要中心点
-                    .color = color,
-                    .rad = 0,     // 三角形不需要半径
-                    .tex_id = -1, // 暂不支持模型纹理
-                    .fuzz = fuzz,
-                    .refl = refl,
-                    .type = TRIANGLE,
-                });
+                // 使用工厂函数，确保所有字段正确初始化
+                objects.push_back(make_triangle(
+                    v0, v1, v2,
+                    color,
+                    refl,
+                    fuzz,
+                    -1,  // tex_id: 暂不支持模型纹理
+                    {0,0,0}  // emission: 无自发光
+                ));
             }
         }
     }

@@ -10,8 +10,8 @@
 
 // [常量内存 (Constant Memory)]
 // 存放场景中的物体数据。
-// 特性: 
-// 1. 只有 64KB 大小，但对于我们的场景 (256个物体 * 112字节 = 28KB) 足够了。
+// 特性:
+// 1. 只有 64KB 大小，但对于我们的场景 (256个物体 * 96字节 = 24KB) 足够了。
 // 2. 带有专用缓存 (Constant Cache)，当所有线程读取同一地址时速度极快 (广播机制)。
 __constant__ Object d_objects[NUM_OBJECTS];
 
@@ -155,56 +155,37 @@ __device__ float intersect(const Object& obj, const Vec& r_o, const Vec& r_d) {
     float eps = 1e-4f; // 防止自遮挡的微小偏移量
 
     // -----------------------------------------------------------
-    // 分支 1: 三角形求交 (Möller–Trumbore 算法)
+    // 三角形求交 (Möller–Trumbore 算法)
     // -----------------------------------------------------------
-    if (obj.type == TRIANGLE) {
-        // 1. 计算两边向量
-        Vec e1 = obj.v1 - obj.v0;
-        Vec e2 = obj.v2 - obj.v0;
+    // 1. 计算两边向量
+    Vec e1 = obj.v1 - obj.v0;
+    Vec e2 = obj.v2 - obj.v0;
 
-        // 2. 计算行列式 (用于判断光线是否平行于三角形平面)
-        Vec h = r_d.cross(e2);
-        float a = e1.dot(h);
+    // 2. 计算行列式 (用于判断光线是否平行于三角形平面)
+    Vec h = r_d.cross(e2);
+    float a = e1.dot(h);
 
-        // 如果 a 接近 0，说明光线平行，未相交
-        if (a > -eps && a < eps) return 0.0f;
+    // 如果 a 接近 0，说明光线平行，未相交
+    if (a > -eps && a < eps) return 0.0f;
 
-        float f = 1.0f / a;
-        Vec s = r_o - obj.v0;
+    float f = 1.0f / a;
+    Vec s = r_o - obj.v0;
 
-        // 3. 计算重心坐标 u
-        float u = f * s.dot(h);
-        if (u < 0.0f || u > 1.0f) return 0.0f; // 超出三角形范围
+    // 3. 计算重心坐标 u
+    float u = f * s.dot(h);
+    if (u < 0.0f || u > 1.0f) return 0.0f; // 超出三角形范围
 
-        Vec q = s.cross(e1);
+    Vec q = s.cross(e1);
 
-        // 4. 计算重心坐标 v
-        float v = f * r_d.dot(q);
-        if (v < 0.0f || u + v > 1.0f) return 0.0f; // 超出三角形范围
+    // 4. 计算重心坐标 v
+    float v = f * r_d.dot(q);
+    if (v < 0.0f || u + v > 1.0f) return 0.0f; // 超出三角形范围
 
-        // 5. 计算距离 t
-        float t = f * e2.dot(q);
+    // 5. 计算距离 t
+    float t = f * e2.dot(q);
 
-        // 只有当 t > eps (在光线前方) 才算有效交点
-        return (t > eps) ? t : 0.0f;
-    }
-    // -----------------------------------------------------------
-    // 分支 2: 球体求交
-    // -----------------------------------------------------------
-    else { // SPHERE
-        // 解一元二次方程
-        Vec op = obj.pos - r_o;
-        float b = op.dot(r_d);
-        float det = b * b - op.dot(op) + obj.rad * obj.rad;
-
-        if (det < 0) return 0; else det = sqrtf(det);
-
-        float t = b - det;
-        if (t > eps) return t;
-        t = b + det;
-        if (t > eps) return t;
-        return 0.0f;
-    }
+    // 只有当 t > eps (在光线前方) 才算有效交点
+    return (t > eps) ? t : 0.0f;
 }
 
 // [内核]: 路径追踪主循环
@@ -254,7 +235,7 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
     Vec throughput = make_vec(1, 1, 1);
     Vec radiance = make_vec(0, 0, 0);
     const int MAX_DEPTH = 10;
-    const int RR_THRESHOLD = 3;
+    const int RR_THRESHOLD = 2;
 
     for (int depth = 0; depth < MAX_DEPTH; depth++) {
         // --- 场景遍历 (寻找最近交点) ---
@@ -274,18 +255,12 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         Vec x_hit = r_o + r_d * d_min;
         
         // --- 法线计算 (几何属性) ---
-        Vec n;
-        if (obj.type == SPHERE) {
-            n = (x_hit - obj.pos).norm();
-        }
-        else { // TRIANGLE
-            // [三角形法线]: 两条边做叉积
-            // 注意: 这里我们使用"面法线" (Face Normal)，整个三角形是平的。
-            // 如果要平滑渲染，需要重心坐标插值顶点法线 (Vertex Normal)，但那是进阶内容。
-            Vec e1 = obj.v1 - obj.v0;
-            Vec e2 = obj.v2 - obj.v0;
-            n = e1.cross(e2).norm();
-        }
+        // [三角形法线]: 两条边做叉积
+        // 注意: 这里我们使用"面法线" (Face Normal)，整个三角形是平的。
+        // 如果要平滑渲染，需要重心坐标插值顶点法线 (Vertex Normal)，但那是进阶内容。
+        Vec e1 = obj.v1 - obj.v0;
+        Vec e2 = obj.v2 - obj.v0;
+        Vec n = e1.cross(e2).norm();
         
         // 确保法线朝向观察者 (双面渲染)
         Vec nl = n.dot(r_d) < 0 ? n : n * -1;
@@ -296,23 +271,12 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         if (obj.tex_id >= 0) {
             float u = 0.0f, v = 0.0f;
 
-            // 球面映射
-            if (obj.type == SPHERE) {
-                Vec p = (x_hit - obj.pos).norm();
-                float phi = atan2f(p.z, p.x);
-                float theta = asinf(p.y);
-                u = 1.0f - (phi + M_PI) / (2.0f * M_PI);
-                v = (theta + M_PI / 2.0f) / M_PI;
-            }
-            // 平面/三角形映射
-            else { // TRIANGLE
-                const float scale = 0.01f;
-                // 根据法线朝向选择投影平面
-                if (fabsf(n.y) > 0.9f)      { u = x_hit.x * scale; v = x_hit.z * scale; }
-                else if (fabsf(n.x) > 0.9f) { u = x_hit.z * scale; v = x_hit.y * scale; }
-                else                        { u = x_hit.x * scale; v = x_hit.y * scale; }
-                v = 1.0f - v; // 翻转 V 轴适配纹理坐标系
-            }
+            const float scale = 0.01f;
+            // 根据法线朝向选择投影平面
+            if (fabsf(n.y) > 0.9f)      { u = x_hit.x * scale; v = x_hit.z * scale; }
+            else if (fabsf(n.x) > 0.9f) { u = x_hit.z * scale; v = x_hit.y * scale; }
+            else                        { u = x_hit.x * scale; v = x_hit.y * scale; }
+            v = 1.0f - v; // 翻转 V 轴适配纹理坐标系
 
             // 硬件采样
             float4 tex = tex2D<float4>(d_textures[obj.tex_id], u, v);
