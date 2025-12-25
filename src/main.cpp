@@ -12,6 +12,7 @@
  * [Input] -> [Camera] -> [Renderer(GPU)] -> [VRAM Snapshot] -> [Pipeline(CPU)] -> [Display]
  */
 
+#include <csignal>
 #include <iostream>
 #include <vector>
 #include <SDL2/SDL.h>
@@ -26,10 +27,21 @@
 #include "input.h"      // 输入管理
 #include "image_io.h"   // 文件保存
 
+// 1. 定义一个全局原子标志位
+std::atomic<bool> quit(false);
+
+// 2. 信号处理函数：只负责修改标志位
+void signal_handler(int signal) {
+    if (signal == SIGINT) {
+        quit = true; // 告诉主循环停止运行
+    }
+}
+
 // ======================================================================================
 // 主函数入口
 // ======================================================================================
 int main(int argc, char** argv) {
+    std::signal(SIGINT, signal_handler);
     // ------------------------------------------------------------------
     // 1. 系统配置
     // ------------------------------------------------------------------
@@ -116,13 +128,19 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     
     int gpu_frame = 1; // 当前 GPU 正在累积第几帧
-    bool quit = false;
+    quit = false;
 
     while (!quit) {
         
         // --- 步骤 A: 输入处理 (Input) ---
         // 所有的 SDL 事件轮询和键盘状态检查都在这里完成
         InputState state = input.process_events(cam);
+
+        // 处理保存请求 (按下 'P' 键)
+        if (state.save_request) {
+            // 保存快照 (使用 h_accum，它是最近一次同步到 CPU 的帧)
+            save_snapshot(h_accum, w, h, gpu_frame, cam.get_focus_dist(), cam.get_aperture()); 
+        }
 
         // 处理退出信号
         if (state.quit) quit = true;
@@ -133,12 +151,6 @@ int main(int argc, char** argv) {
         if (state.camera_moved) {
             gpu_frame = 1;
             cudaMemset(d_accum, 0, size_bytes); // 异步清零，速度极快
-        }
-
-        // 处理保存请求 (按下 'P' 键)
-        if (state.save_request) {
-            // 保存快照 (使用 h_accum，它是最近一次同步到 CPU 的帧)
-            save_snapshot(h_accum, w, h, gpu_frame, cam.get_focus_dist(), cam.get_aperture()); 
         }
 
         // --- 步骤 B: GPU 渲染 (Render Dispatch) ---
@@ -190,6 +202,7 @@ int main(int argc, char** argv) {
         // 帧数计数器自增
         gpu_frame++;
     }
+    save_snapshot(h_accum, w, h, gpu_frame, cam.get_focus_dist(), cam.get_aperture()); 
 
     // ------------------------------------------------------------------
     // 6. 资源清理 (Cleanup)
