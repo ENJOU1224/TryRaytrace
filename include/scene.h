@@ -17,10 +17,9 @@ enum Refl_t {
 
 // [几何体类型]
 // 影响光线求交的数学公式
-enum Shape_t { 
+enum Shape_t {
     SPHERE,   // 球体: 简单的解析几何求交，速度最快
-    TRIANGLE, // 三角形: Möller–Trumbore 算法
-    PLANE     // 无限平面: 用于定义墙壁地面
+    TRIANGLE  // 三角形: Möller–Trumbore 算法，用于墙壁、模型等
 };
 
 // ======================================================================================
@@ -57,8 +56,13 @@ struct Object {
     
     float rad;    // [复用]: 球体半径 Radius | 平面常数 D
     int tex_id;   // [纹理]: -1 表示无纹理
+    float fuzz;   // [粗糙度]
+    float padding;// 4 [占位]
+                  
     Refl_t refl;  // [材质]: 枚举本质上是 int (4字节)
     Shape_t type; // [类型]: 枚举本质上是 int (4字节)
+    float pad2;   // 4
+    float pad3;   // 4
 };
 
 // ======================================================================================
