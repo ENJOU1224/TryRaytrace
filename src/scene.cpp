@@ -54,7 +54,8 @@ Scene create_cornell_box() {
              {50.0f, 10.0f, 130.0f}, // 位置: 放在盒子中间偏上
              10.0f,                 // 缩放: 模型原始大小是 -1到1，放大10倍
              gold,                  // 颜色: 金色
-             SPEC);                 // 材质: 镜面
+             SPEC,                  // 材质: 镜面
+             0.9f);                 
 
     // --- 球体 (Sphere) ---
     scene.objects.push_back({ 
@@ -70,6 +71,7 @@ Scene create_cornell_box() {
         .color={0.99f, 0.99f, 0.99f}, 
         .rad=16.5f, 
         .tex_id=-1, 
+        .fuzz = 1,
         .refl=SPEC, 
         .type=SPHERE
     }); // 玻璃球 (右侧)

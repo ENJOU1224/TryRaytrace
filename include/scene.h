@@ -57,8 +57,13 @@ struct Object {
     
     float rad;    // [复用]: 球体半径 Radius | 平面常数 D
     int tex_id;   // [纹理]: -1 表示无纹理
+    float fuzz;   // [粗糙度]
+    float padding;// 4 [占位]
+                  
     Refl_t refl;  // [材质]: 枚举本质上是 int (4字节)
     Shape_t type; // [类型]: 枚举本质上是 int (4字节)
+    float pad2;   // 4
+    float pad3;   // 4
 };
 
 // ======================================================================================

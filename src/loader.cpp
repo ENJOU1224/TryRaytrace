@@ -20,7 +20,7 @@
 // ======================================================================================
 
 void load_obj(const char* filename, std::vector<Object>& objects, 
-              Vec offset, float scale, Vec color, Refl_t refl) {
+              Vec offset, float scale, Vec color, Refl_t refl, float fuzz) {
     
     // 打开文件 (只读模式)
     FILE* file = fopen(filename, "r");
@@ -95,6 +95,7 @@ void load_obj(const char* filename, std::vector<Object>& objects,
                     .color = color,
                     .rad = 0,     // 三角形不需要半径
                     .tex_id = -1, // 暂不支持模型纹理
+                    .fuzz = fuzz,
                     .refl = refl,
                     .type = TRIANGLE,
                 });

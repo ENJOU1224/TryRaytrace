@@ -368,7 +368,32 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         } 
         else if (obj.refl == SPEC) {
             // [镜面反射]: 完美反射
-            r_d = r_d - n * 2 * n.dot(r_d); 
+            Vec reflected = r_d - n * 2 * n.dot(r_d); 
+
+            // 2. [新增] 粗糙度扰动
+            // 在单位球内随机取一点
+            // 简单且常用的方法：随机取单位圆盘上的点，甚至简单的立方体内取点归一化
+            // 这里用 curand 生成随机单位向量
+            float r1 = 2 * M_PI * curand_uniform(&state);
+            float r2 = curand_uniform(&state);
+            float z = 1.0f - 2.0f * r2;
+            float r = sqrtf(1.0f - z * z);
+            Vec random_sphere = make_vec(r * cosf(r1), r * sinf(r1), z);
+            
+            // 混合: 完美方向 + 粗糙度 * 随机方向
+            // 然后归一化
+            r_d = (reflected + random_sphere * obj.fuzz).norm();
+            
+            // 3. 吸收检查
+            // 如果扰动太大，导致光线射向了物体内部 (和法线点积 < 0)，这物理上是不可能的(被挡住了)。
+            // 这种情况下这束光线就"死"了 (被表面微结构吸收)。
+            if (r_d.dot(n) <= 0.0f) {
+                // 变成全黑，或者 break
+                f = make_vec(0,0,0); // 吸收
+                // 或者重新采样 (rejection sampling)，但这会分叉
+                // 简单起见，吸收掉
+                break;
+            }
             r_o = x_hit + r_d * 1e-3f; // 沿着反射方向推
         } 
         else { // REFR
