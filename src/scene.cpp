@@ -94,11 +94,11 @@ Scene create_cornell_box() {
     // 调用 loader 模块来加载 cube.obj 文件
     // 参数: 文件名, 目标容器, 位置偏移, 缩放大小, 颜色, 材质
     load_obj("assets/teapot.obj", scene.objects, 
-             {50.0f, 30.0f, 50.0f}, // 位置: 放在盒子中间偏上
+             {50.0f, 10.0f, 50.0f}, // 位置: 放在盒子中间偏上
              10.0f,                 // 缩放: 模型原始大小是 -1到1，放大10倍
              white,    // 颜色: 金色
-             0.0f,                  // 材质: 镜面
-             0.0f);                 
+             1.0f,                  // 材质: 镜面
+             0.1f);                 
 
     // 打印场景信息
     printf("[Scene] Scene created with %lu objects.\n", scene.objects.size());

@@ -360,7 +360,7 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
     // -----------------------------------------------------------
     Vec throughput = make_vec(1, 1, 1);
     Vec radiance = make_vec(0, 0, 0);
-    const int MAX_DEPTH = 10;
+    const int MAX_DEPTH = 30;
     const int RR_THRESHOLD = 3;
     Refl_t prev_refl_mode = SPEC;
 
@@ -487,10 +487,11 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         // 3. 如果上一次是漫反射 (DIFF)，不能加！(因为 NEE 已经算过这盏灯对漫反射的贡献了)。
         
         bool is_specular_bounce = (prev_refl_mode == SPEC) || (prev_refl_mode == REFR);
-        // bool is_specular_bounce = (prev_refl_mode == REFR);
         
         if (is_specular_bounce) {
-             radiance = radiance + throughput.mult(obj.emission);
+            // if(depth >= 2)radiance = radiance + throughput.mult(obj.emission).mult({99,99,99}) ;
+            // else radiance = radiance + throughput.mult(obj.emission).mult({0.1,0.1,0.1}) ;
+            radiance = radiance + throughput.mult(obj.emission) ;
         }
 
         if (obj.emission.x > 0.001f || obj.emission.y > 0.001f || obj.emission.z > 0.001f) {
@@ -731,6 +732,27 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
             prev_refl_mode = DIFF; 
         }
         
+    }
+
+        // [修复] 终极防火墙：过滤 NaN 和 Inf
+    // 只要 RGB 任何一个分量坏了，这一帧的采样就直接作废，不要污染历史数据。
+    if (isnan(radiance.x) || isnan(radiance.y) || isnan(radiance.z) ||
+        isinf(radiance.x) || isinf(radiance.y) || isinf(radiance.z)) {
+        return; // 直接丢弃这次采样
+    }
+
+    // [修复] 负值过滤
+    // 某些极端情况下（如法线插值错误），可能算出负能量，这也会搞坏累加器
+    if (radiance.x < 0.0f) radiance.x = 0.0f;
+    if (radiance.y < 0.0f) radiance.y = 0.0f;
+    if (radiance.z < 0.0f) radiance.z = 0.0f;
+
+    // [修复] 亮度钳制 (Firefly Clamp)
+    // 防止单帧超高亮度破坏平均值
+    float max_lum = 100.0f; 
+    float lum = radiance.x * 0.21 + radiance.y * 0.71 + radiance.z * 0.07;
+    if (lum > max_lum) {
+        radiance = radiance * (max_lum / lum);
     }
     
     // 写入显存
