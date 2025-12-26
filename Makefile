@@ -20,7 +20,7 @@ TARGET = $(OBJ_DIR)/cuda_engine
 
 # 源文件列表
 # 这里我们显式列出对象文件，Make 会根据模式规则去 src/ 找对应的源文件
-OBJS_NAMES = renderer.o pipeline.o camera.o scene.o loader.o input.o image_io.o main.o
+OBJS_NAMES = bvh.o renderer.o pipeline.o camera.o scene.o loader.o input.o image_io.o main.o
 OBJS = $(addprefix $(OBJ_DIR)/, $(OBJS_NAMES))
 
 # -----------------------------------------------------------------------------

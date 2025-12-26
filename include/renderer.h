@@ -2,6 +2,7 @@
 
 // 引入场景定义，我们需要 Object 和 CameraParams 结构体
 #include "scene.h"
+#include "bvh.h"
 
 // ======================================================================================
 // 渲染器接口 (Renderer Interface)
@@ -27,8 +28,11 @@
 // 参数:
 //   objects:       包含所有物体数据的 vector (将拷贝到 GPU 常量内存)
 //   texture_files: 纹理文件路径列表 (用于加载图片并上传到 GPU Texture Memory)
+//   nodes:         线性bvh树
 // --------------------------------------------------------------------------------------
-void init_scene_data(const std::vector<Object>& objects, const std::vector<std::string>& texture_files);
+void init_scene_data(const std::vector<Object>& objects, 
+                     const std::vector<std::string>& texture_files,
+                     const std::vector<LinearBVHNode>& nodes);
 
 // --------------------------------------------------------------------------------------
 // [接口 2] 启动渲染内核 (Kernel Launcher)

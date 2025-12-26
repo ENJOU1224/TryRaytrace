@@ -1,5 +1,6 @@
 #pragma once 
 #include "common.h" // 需要 Vec 定义
+#include "aabb.h"
 #include <string>
 #include <vector>
 
@@ -13,14 +14,6 @@ enum Refl_t {
     DIFF, // 漫反射 (Diffuse): 朗伯余弦分布，模拟粗糙表面
     SPEC, // 镜面反射 (Specular): 完美反射，模拟镜子/金属
     REFR  // 折射 (Refractive): 斯涅尔定律 + 菲涅尔效应，模拟玻璃/水
-};
-
-// [几何体类型]
-// 影响光线求交的数学公式
-enum Shape_t { 
-    SPHERE,   // 球体: 简单的解析几何求交，速度最快
-    TRIANGLE, // 三角形: Möller–Trumbore 算法
-    PLANE     // 无限平面: 用于定义墙壁地面
 };
 
 // ======================================================================================
@@ -39,26 +32,26 @@ struct Object {
     
     // [三角形专用]
     // 为了支持网格模型，我们需要存储三个顶点。
-    // 虽然球体和平面用不到这 48 字节，但为了保持 Object 大小统一以放入数组，这是必要的牺牲。
     Vec v0, v1, v2; 
 
-    // [通用几何属性]
-    // 球体: 圆心位置 (Position)
-    // 平面: 法线向量 (Normal)
-    // 三角形: (未使用，法线在 Kernel 中通过 v0/v1/v2 实时计算)
-    Vec pos;   
-
     // [材质属性]
-    Vec color;    // 表面基础颜色 (Albedo)
+    Vec albedo;   // 原来的 color。非金属的漫反射颜色 / 金属的反射颜色
     Vec emission; // 自发光强度 (Light Source)
 
     // --- 4字节的小块数据 (Scalars) ---
     // 将它们凑在一起，刚好填满一个 16 字节的 Cache Line
     
-    float rad;    // [复用]: 球体半径 Radius | 平面常数 D
-    int tex_id;   // [纹理]: -1 表示无纹理
-    Refl_t refl;  // [材质]: 枚举本质上是 int (4字节)
-    Shape_t type; // [类型]: 枚举本质上是 int (4字节)
+    float metallic;   // [0.0 - 1.0] 0=塑料/木头, 1=金属
+    float roughness;  // [0.0 - 1.0] 0=光滑, 1=粗糙
+    float ior;        // 折射率 (Index of Refraction), 玻璃=1.45, 水=1.33
+    float transmission; // [0.0 - 1.0] 0=不透明, 1=玻璃
+
+    // 还需要存纹理ID，这得另起一行了
+    int tex_id; 
+    
+    // 填充 12 字节 (3个float) 保持 16 字节对齐
+    float pad1, pad2, pad3;
+
 };
 
 // ======================================================================================
@@ -93,6 +86,8 @@ struct CameraParams {
 struct Scene {
     std::vector<Object> objects;
     std::vector<std::string> texture_files;
+
+    AABB world_bound;
 };
 
 // 工厂函数
