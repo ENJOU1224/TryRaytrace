@@ -29,10 +29,13 @@
 //   objects:       包含所有物体数据的 vector (将拷贝到 GPU 常量内存)
 //   texture_files: 纹理文件路径列表 (用于加载图片并上传到 GPU Texture Memory)
 //   nodes:         线性bvh树
+//   light_indices: 光源索引
 // --------------------------------------------------------------------------------------
+// 增加 int light_count 参数
 void init_scene_data(const std::vector<Object>& objects, 
                      const std::vector<std::string>& texture_files,
-                     const std::vector<LinearBVHNode>& nodes);
+                     const std::vector<LinearBVHNode>& nodes,
+                     const std::vector<int>& light_indices); // [新增]
 
 // --------------------------------------------------------------------------------------
 // [接口 2] 启动渲染内核 (Kernel Launcher)

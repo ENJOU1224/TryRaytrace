@@ -78,12 +78,6 @@ void load_obj(const char* filename, std::vector<Object>& objects,
                 Vec v1 = temp_vertices[idx[1] - 1];
                 Vec v2 = temp_vertices[idx[2] - 1];
 
-                // [容量检查]
-                // 防止物体数量超过 GPU 常量内存限制 (NUM_OBJECTS)
-                if (objects.size() >= NUM_OBJECTS) {
-                    printf("[Loader Warning] Scene full! Capped at %d objects.\n", NUM_OBJECTS);
-                    break; // 停止加载后续三角形
-                }
 
                 // [构建三角形对象]
                 // 使用 C++20 指定初始化器，清晰明了
