@@ -73,7 +73,6 @@ InputState InputManager::process_events(CameraController& cam) {
         if (e.type == SDL_KEYDOWN) {
             switch (e.key.keysym.sym) {
                 case SDLK_ESCAPE: 
-                    state.save_request = true; // 请求保存截图
                     state.quit = true; 
                     break;
                 case SDLK_p:      

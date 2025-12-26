@@ -26,6 +26,7 @@
 #include "pipeline.h"   // CPU 后台处理流水线
 #include "input.h"      // 输入管理
 #include "image_io.h"   // 文件保存
+#include "bvh.h"        // bvh
 
 // 1. 定义一个全局原子标志位
 std::atomic<bool> quit(false);
@@ -77,9 +78,15 @@ int main(int argc, char** argv) {
     // 工厂模式：scene.cpp 负责生产数据，main 只负责拿到 Scene 对象
     Scene scene = create_cornell_box();
     
+    // [新增] 构建 BVH
+    // 注意：这一步会打乱 scene.objects 的顺序！
+    // 所以必须在 init_scene_data 之前做。
+    BVH bvh;
+    bvh.build(scene.objects);
+
     // [渲染模块]: 将场景数据上传到 GPU 常量内存
     // 这一步之后，GPU 就知道场景里有什么物体了
-    init_scene_data(scene.objects, scene.texture_files);
+    init_scene_data(scene.objects, scene.texture_files, bvh.get_nodes());
 
     // [相机模块]: 初始化第一人称相机
     // 参数: 初始位置 (50, 52, 295.6), 初始朝向 (0, -0.04, -1)

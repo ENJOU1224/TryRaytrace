@@ -10,4 +10,4 @@
 // color:    材质颜色
 // refl:     材质类型
 void load_obj(const char* filename, std::vector<Object>& objects, 
-              Vec offset, float scale, Vec color, Refl_t refl, float fuzz = 0.0f);
+              Vec offset, float scale, Vec albedo, float metallic, float roughness );

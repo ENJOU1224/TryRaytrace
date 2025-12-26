@@ -1,6 +1,16 @@
 #include "scene.h"
 #include "loader.h" // 引入 OBJ 加载器
 
+// 辅助函数: 添加一个矩形 (2个三角形)
+// p0, p1, p2, p3 逆时针顺序
+void add_quad(Scene& scene, Vec p0, Vec p1, Vec p2, Vec p3, Vec color, Vec emission, Refl_t refl) {
+    scene.objects.push_back({
+        .v0=p0, .v1=p1, .v2=p2, 
+    });
+    scene.objects.push_back({
+        .v0=p0, .v1=p2, .v2=p3, 
+    });
+}
 // ======================================================================================
 // 工厂函数: create_cornell_box()
 // ======================================================================================
@@ -27,69 +37,87 @@ Scene create_cornell_box() {
     // 预定义颜色可以提高代码可读性，避免魔法数字
     Vec white = {0.75f, 0.75f, 0.75f};
     Vec red   = {0.75f, 0.25f, 0.25f};
-    Vec blue  = {0.25f, 0.25f, 0.75f};
-    Vec gold  = {0.8f,  0.6f,  0.2f};
-    Vec light = {12.0f, 12.0f, 12.0f}; // 高强度自发光
+    Vec green = {0.25f, 0.75f, 0.25f}; // 原版Cornell Box右墙是绿的，你之前是蓝的，看你喜好
+    Vec light_color = {20, 20, 20};
+    Vec black = {0,0,0};
+
+    // 辅助 lambda: 快速生成 PBR 材质参数
+    // 默认是粗糙的非金属
+    auto make_mat = [](float m, float r, float t = 0.0f, float ior = 1.45f) {
+        // 返回 metallic, roughness, ior, transmission
+        struct { float m, r, i, t; } p = {m, r, ior, t};
+        return p;
+    };
 
     // ------------------------------------------------------------------
     // 3. 物体构建 (Procedural Scene Generation)
     // ------------------------------------------------------------------
-    // 使用 C++20 指定初始化器 (.field = value) 语法，清晰且不易出错。
+    // 墙壁 (粗糙非金属)
+    auto wall_mat = make_mat(0.0f, 1.0f);
     
-    // --- 墙壁 (Plane) ---
-    // [坐标系]: X(左右), Y(上下), Z(前后)
-    // [平面方程]: N·P = D,  其中 N = pos, D = rad
+    // 1. 地板 (y=0)
+    scene.objects.push_back({
+        .v0={-50,0,0}, .v1={50,0,600}, .v2={150,0,0}, 
+        .albedo=white, .emission=black, .metallic=wall_mat.m, .roughness=wall_mat.r, .ior=wall_mat.i, .transmission=wall_mat.t, .tex_id=-1});
     
-    scene.objects.push_back({ .pos={ 1, 0, 0}, .color=red    ,  .rad=1.0f   , .tex_id=-1, .refl=DIFF, .type=PLANE});    // 左墙: x=1,   法线朝右
-    scene.objects.push_back({ .pos={-1, 0, 0}, .color=blue   ,  .rad=-99.0f , .tex_id=-1, .refl=DIFF, .type=PLANE});    // 右墙: x=99,  法线朝左
-    scene.objects.push_back({ .pos={ 0, 0, 1}, .color={1,1,1},  .rad=0.0f   , .tex_id=0 , .refl=DIFF, .type=PLANE});    // 后墙: z=0,   法线朝前 (贴风景图)
-    scene.objects.push_back({ .pos={ 0, 1, 0}, .color=white  ,  .rad=0.0f   , .tex_id=-1, .refl=DIFF, .type=PLANE});    // 地板: y=0,   法线朝上
-    scene.objects.push_back({ .pos={ 0,-1, 0}, .color=white  ,  .rad=-81.6f , .tex_id=-1, .refl=DIFF, .type=PLANE});    // 天花板: y=81.6, 法线朝下
-    // 注意: 前墙已移除，允许相机自由进出
+    // 2. 天花板 (y=100)
+    scene.objects.push_back({
+        .v0={-50,100,0}, .v1={150,100,0}, .v2={50,100,600}, 
+        .albedo=white, .emission=black, .metallic=wall_mat.m, .roughness=wall_mat.r, .ior=wall_mat.i, .transmission=wall_mat.t, .tex_id=-1});
+
+    // 3. 后墙 (z=0)
+    scene.objects.push_back({
+        .v0={-50,0,0}, .v1={150,0,0}, .v2={50,200,0}, 
+        .albedo=white, .emission=black, .metallic=wall_mat.m, .roughness=wall_mat.r, .ior=wall_mat.i, .transmission=wall_mat.t, .tex_id=0});
+
+    // 3. 后墙 (z=0)
+    scene.objects.push_back({
+        .v0={-50,0,300}, .v1={150,0,300}, .v2={50,200,300}, 
+        .albedo=black, .emission=black, .metallic=1, .roughness=0, .ior=0, .transmission=0, .tex_id=-1});
+
+    // 4. 左墙 (x=0, 红)
+    scene.objects.push_back({
+        .v0={0,0,-50}, .v1={0,200,50}, .v2={0,0,550}, 
+        .albedo=red, .emission=black, .metallic=wall_mat.m, .roughness=wall_mat.r, .ior=wall_mat.i, .transmission=wall_mat.t, .tex_id=-1});
+
+    // 5. 右墙 (x=100, 绿)
+    scene.objects.push_back({
+        .v0={100,0,550}, .v1={100,200,50}, .v2={100,0,-50}, 
+        .albedo=green, .emission=black, .metallic=wall_mat.m, .roughness=wall_mat.r, .ior=wall_mat.i, .transmission=wall_mat.t, .tex_id=-1});
+
+    // 6. 顶灯 (天花板中间的一个方块)
+    scene.objects.push_back({
+        .v0={30,99.9,30}, .v1={70,99.9,30}, .v2={50,99.9,50}, 
+        .albedo=black, .emission=light_color, .metallic=wall_mat.m, .roughness=wall_mat.r, .ior=wall_mat.i, .transmission=wall_mat.t, .tex_id=-1});
 
     // --- 外部模型 (Mesh) ---
     // 调用 loader 模块来加载 cube.obj 文件
     // 参数: 文件名, 目标容器, 位置偏移, 缩放大小, 颜色, 材质
     load_obj("assets/cube.obj", scene.objects, 
-             {50.0f, 10.0f, 130.0f}, // 位置: 放在盒子中间偏上
+             {50.0f, 10.0f, 50.0f}, // 位置: 放在盒子中间偏上
              10.0f,                 // 缩放: 模型原始大小是 -1到1，放大10倍
-             gold,                  // 颜色: 金色
-             SPEC,                  // 材质: 镜面
-             0.9f);                 
-
-    // --- 球体 (Sphere) ---
-    scene.objects.push_back({ 
-        .pos={73.0f, 16.5f, 78.0f},
-        .color={0.99f, 0.99f, 0.99f}, 
-        .rad=16.5f, 
-        .tex_id=-1, 
-        .refl=REFR, 
-        .type=SPHERE
-    }); // 玻璃球 (右侧)
-    scene.objects.push_back({ 
-        .pos={27.0f, 16.5f, 47.0f},
-        .color={0.99f, 0.99f, 0.99f}, 
-        .rad=16.5f, 
-        .tex_id=-1, 
-        .fuzz = 1,
-        .refl=SPEC, 
-        .type=SPHERE
-    }); // 玻璃球 (右侧)
-
-    // --- 光源 (Light) ---
-    // 这是一个自发光的球体，模拟吸顶灯
-    scene.objects.push_back({ 
-        .pos={50.0f, 681.33f, 81.6f},
-        .color={0,0,0},         // 灯的表面颜色是黑的 (不反射)
-        .emission=light,        // 但它自己会发光
-        .rad=600.0f, 
-        .tex_id=-1, 
-        .refl=DIFF,       // 灯本身是漫反射材质
-        .type=SPHERE, 
-    });
+             {0.8f, 0.6f, 0.2f},    // 颜色: 金色
+             1.0f,                  // 材质: 镜面
+             0.2f);                 
 
     // 打印场景信息
     printf("[Scene] Scene created with %lu objects.\n", scene.objects.size());
+
+    scene.world_bound = AABB::empty();
+    
+    for (const auto& obj : scene.objects) {
+      scene.world_bound.grow(obj.v0);
+      scene.world_bound.grow(obj.v1);
+      scene.world_bound.grow(obj.v2);
+    }
+
+    // 稍微把盒子往外扩一点点 (Epsilon)，防止刚好贴边导致误判
+    scene.world_bound.min = scene.world_bound.min - make_vec(0.1f, 0.1f, 0.1f);
+    scene.world_bound.max = scene.world_bound.max + make_vec(0.1f, 0.1f, 0.1f);
+
+    printf("[Scene] World Bound: Min(%.1f, %.1f, %.1f) Max(%.1f, %.1f, %.1f)\n",
+           scene.world_bound.min.x, scene.world_bound.min.y, scene.world_bound.min.z,
+           scene.world_bound.max.x, scene.world_bound.max.y, scene.world_bound.max.z);
 
     return scene;
 }
