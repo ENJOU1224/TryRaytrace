@@ -91,6 +91,9 @@ struct __align__(16) Vec {
     __host__ __device__ Vec cross(const Vec& b) const { 
         return {y * b.z - z * b.y, z * b.x - x * b.z, x * b.y - y * b.x}; 
     }
+
+    __host__ __device__ float norm_len() const { return sqrtf(x*x + y*y + z*z); }
+
 };
 
 // ======================================================================================
@@ -123,3 +126,4 @@ inline float clamp(float x) {
 inline int toInt(float x) { 
     return int(pow(clamp(x), 1 / 2.2) * 255 + .5); 
 }
+

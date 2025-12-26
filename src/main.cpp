@@ -84,13 +84,25 @@ int main(int argc, char** argv) {
     BVH bvh;
     bvh.build(scene.objects);
 
-    // [渲染模块]: 将场景数据上传到 GPU 常量内存
-    // 这一步之后，GPU 就知道场景里有什么物体了
-    init_scene_data(scene.objects, scene.texture_files, bvh.get_nodes());
+    // [新增] 筛选光源
+    std::vector<int> light_indices;
+    for (size_t i = 0; i < scene.objects.size(); i++) {
+        // 只要发光强度 > 0，就认为是灯
+        // 忽略那微弱的环境光，只算强光
+        const auto& e = scene.objects[i].emission;
+        if (e.x > 0.1f || e.y > 0.1f || e.z > 0.1f) {
+            light_indices.push_back((int)i);
+        }
+    }
+
+
+    // [渲染模块]: 将场景数据上传到 GPU 全局内存
+    // 传入 light_indices
+    init_scene_data(scene.objects, scene.texture_files, bvh.get_nodes(), light_indices);
 
     // [相机模块]: 初始化第一人称相机
     // 参数: 初始位置 (50, 52, 295.6), 初始朝向 (0, -0.04, -1)
-    CameraController cam({50, 52, 295.6}, {0, -0.042612, -1});
+    CameraController cam({50, 50, 295.6}, {0, 0, -1});
 
     // ------------------------------------------------------------------
     // 3. 内存与显存分配 (双缓冲架构的核心)

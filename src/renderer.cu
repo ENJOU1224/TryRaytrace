@@ -10,12 +10,9 @@
 // 全局显存数据 (Global GPU Memory)
 // ======================================================================================
 
-// [常量内存 (Constant Memory)]
-// 存放场景中的物体数据。
-// 特性: 
-// 1. 只有 64KB 大小，但对于我们的场景 (256个物体 * 112字节 = 28KB) 足够了。
-// 2. 带有专用缓存 (Constant Cache)，当所有线程读取同一地址时速度极快 (广播机制)。
-__constant__ Object d_objects[NUM_OBJECTS];
+// 全局显存指针
+// 这个指针本身存在 CPU 内存上，但它存储的地址指向 GPU 显存
+Object* d_objects_ptr = nullptr;
 
 // [纹理句柄数组]
 // 存放由 CUDA Runtime API 创建的纹理对象 (Texture Object)。
@@ -26,6 +23,10 @@ __constant__ cudaTextureObject_t d_textures[MAX_TEXTURES];
 // [新增] BVH 节点数据 (Global Memory)
 // 节点数量可能很多，常量内存放不下，所以用普通显存指针
 LinearBVHNode* d_bvh_nodes = nullptr;
+
+// [新增] 光源索引数组
+int* d_light_indices = nullptr;
+int d_light_count = 0; // 这是一个 Host 端的变量，但在 Kernel 启动时传进去，或者拷贝到 Symbol
 
 // ======================================================================================
 // 辅助工具: 手写 P6 图片加载器 (Host CPU)
@@ -132,14 +133,21 @@ cudaTextureObject_t load_texture_to_gpu(const std::string& filename) {
 // ======================================================================================
 void init_scene_data(const std::vector<Object>& objects, 
                      const std::vector<std::string>& texture_files,
-                     const std::vector<LinearBVHNode>& nodes) {
-    // 1. 上传物体数据到常量内存
+                     const std::vector<LinearBVHNode>& nodes,
+                     const std::vector<int>& light_indices) {
+    // 1. 上传物体数据到全局内存
     int count = objects.size();
-    if (count > NUM_OBJECTS) {
-        printf("[Warning] Object count (%d) exceeds limit (%d). Truncating.\n", count, NUM_OBJECTS);
-        count = NUM_OBJECTS;
-    }
-    cudaMemcpyToSymbol(d_objects, objects.data(), count * sizeof(Object));
+    size_t objects_size = count * sizeof(Object);
+
+    // 如果之前分配过，先释放
+    if (d_objects_ptr) cudaFree(d_objects_ptr);
+
+    // 申请显存 (不再受 64KB 限制，显存有多大就能申请多大)
+    cudaMalloc(&d_objects_ptr, objects_size);
+    cudaMemcpy(d_objects_ptr, objects.data(), objects_size, cudaMemcpyHostToDevice);
+
+    printf("[Renderer] Uploaded %d objects to Global Memory (%.2f KB).\n", 
+           count, objects_size / 1024.0f);
 
     // 2. 加载并上传纹理
     std::vector<cudaTextureObject_t> temp_tex_objs;
@@ -160,6 +168,27 @@ void init_scene_data(const std::vector<Object>& objects,
     cudaMemcpy(d_bvh_nodes, nodes.data(), nodes_size, cudaMemcpyHostToDevice);
     
     printf("[Renderer] Uploaded %lu BVH nodes to GPU.\n", nodes.size());
+
+    // 4. [新增] 上传光源索引
+    if (d_light_indices) cudaFree(d_light_indices);
+    d_light_count = light_indices.size();
+    
+    if (d_light_count > 0) {
+        size_t lights_size = d_light_count * sizeof(int);
+        cudaMalloc(&d_light_indices, lights_size);
+        cudaMemcpy(d_light_indices, light_indices.data(), lights_size, cudaMemcpyHostToDevice);
+        printf("[Renderer] Lights registered: %d\n", d_light_count);
+    } else {
+        printf("[Renderer Warning] No lights found in scene!\n");
+    }
+}
+
+
+// [辅助函数] 计算三角形面积
+__device__ float triangle_area(const Object& obj) {
+    Vec e1 = obj.v1 - obj.v0;
+    Vec e2 = obj.v2 - obj.v0;
+    return e1.cross(e2).norm_len() * 0.5f; 
 }
 
 // ============================================================================
@@ -238,8 +267,54 @@ __device__ float intersect(const Object& obj, const Vec& r_o, const Vec& r_d) {
       return 0.0f;     
 }
 
+// [阴影光线测试]
+// 检查从 origin 到 target 之间是否有遮挡
+// max_dist: origin 到 target 的距离 (我们会稍微减一点点以防止打中 target 自己)
+__device__ bool trace_shadow(const Vec& origin, const Vec& dir, float max_dist, 
+                             LinearBVHNode* nodes, Object* scene_objects) {
+    
+    Vec r_inv_d = make_vec(1.0f / dir.x, 1.0f / dir.y, 1.0f / dir.z);
+    
+    int stack[32];
+    int ptr = 0;
+    stack[ptr++] = 0;
+
+    while (ptr > 0) {
+        int idx = stack[--ptr];
+        LinearBVHNode node = nodes[idx];
+
+        // AABB 测试
+        // 注意：t_max 设为 max_dist。如果盒子比灯还远，就不需要检测了。
+        if (!node.bounds.hit(origin, r_inv_d, 0.001f, max_dist)) continue;
+
+        if (node.is_leaf) {
+            for (int k = 0; k < node.primitive_count; k++) {
+                int obj_idx = node.primitive_offset + k;
+                const Object& obj = scene_objects[obj_idx];
+                
+                // 这里我们要忽略光源自己 (虽然 max_dist 已经限制了，但为了保险)
+                // 简单的做法是：如果撞到的物体是发光的，我们认为它是光源，不构成遮挡
+                // 但更严谨的做法是依靠距离判断。
+                
+                float t = intersect(obj, origin, dir);
+                
+                // [关键] 只要发现一个物体挡在中间 (0.001 < t < max_dist)
+                // 立即返回 true (有遮挡)
+                if (t > 0.001f && t < max_dist - 0.001f) {
+                    return true; // 被挡住了！
+                }
+            }
+        } else {
+            stack[ptr++] = node.right_child_idx;
+            stack[ptr++] = node.left_child_idx;
+        }
+    }
+    
+    return false; // 一路通畅，没遮挡
+}
+
 // [内核]: 路径追踪主循环
-__global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int frame_seed, CameraParams cam, LinearBVHNode* bvh_nodes) {
+__global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int frame_seed, CameraParams cam, LinearBVHNode* bvh_nodes, Object* scene_objects, int* light_indices, int light_count) {
     // 1. 线程索引与边界检查
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -285,8 +360,9 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
     // -----------------------------------------------------------
     Vec throughput = make_vec(1, 1, 1);
     Vec radiance = make_vec(0, 0, 0);
-    const int MAX_DEPTH = 10;
+    const int MAX_DEPTH = 30;
     const int RR_THRESHOLD = 3;
+    Refl_t prev_refl_mode = SPEC;
 
     for (int depth = 0; depth < MAX_DEPTH; depth++) {
         // -----------------------------------------------------------
@@ -331,7 +407,7 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
                 for (int i = 0; i < node.primitive_count; i++) {
                     int obj_idx = node.primitive_offset + i;
                     // 求交
-                    float t = intersect(d_objects[obj_idx], r_o, r_d);
+                    float t = intersect(scene_objects[obj_idx], r_o, r_d);
                     // 如果打中了，且比当前最近的还要近
                     if (t > 0.0f && t < d_min) {
                         d_min = t;
@@ -355,7 +431,7 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         // 此时 d_min 存的就是全场景最近交点，id 是物体索引
 
 
-        const Object& obj = d_objects[id];
+        const Object& obj = scene_objects[id];
         Vec x_hit = r_o + r_d * d_min;
         
         // --- 法线计算 (几何属性) ---
@@ -405,8 +481,79 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         }
 
         // --- 2. 自发光累加 ---
-        // 无论后面怎么反射，如果撞到了光源，先把光加进来
-        radiance = radiance + throughput.mult(obj.emission);
+        // [NEE 修正]: 
+        // 1. 如果是第一帧 (depth==0)，必须加 (直接看灯)。
+        // 2. 如果上一次是镜面反射 (SPEC)，必须加 (因为 NEE 不处理镜面)。
+        // 3. 如果上一次是漫反射 (DIFF)，不能加！(因为 NEE 已经算过这盏灯对漫反射的贡献了)。
+        
+        bool is_specular_bounce = (prev_refl_mode == SPEC) || (prev_refl_mode == REFR);
+        
+        if (is_specular_bounce) {
+            // if(depth >= 2)radiance = radiance + throughput.mult(obj.emission).mult({99,99,99}) ;
+            // else radiance = radiance + throughput.mult(obj.emission).mult({0.1,0.1,0.1}) ;
+            radiance = radiance + throughput.mult(obj.emission) ;
+        }
+
+        if (obj.emission.x > 0.001f || obj.emission.y > 0.001f || obj.emission.z > 0.001f) {
+            break; 
+        }
+
+        // =========================================================
+        // [PBR 光路选择: 基于能量的重要性采样]
+        // =========================================================
+        
+        // 1. 准备非线性参数
+        // [金属度曲线]: 只要有一点金属度，就大幅抑制漫反射。
+        // 使用平滑阶梯或者幂函数。这里用幂函数让它更"硬"。
+        // 0.5 -> 0.06, 0.1 -> 0.0001
+        float diffuse_suppression = powf(1.0f - metallic, 2.0f); 
+        
+        // [粗糙度曲线]: 粗糙度越高，镜面反射的"视觉权重"下降得越快。
+        // 我们用这个系数来衰减 Specular 的采样概率。
+        // 0.0 -> 1.0 (全反射), 1.0 -> 0.0 (无反射)
+        float spec_attenuation = 1.0f - (roughness * roughness);
+        if (spec_attenuation < 0.0f) spec_attenuation = 0.0f;
+
+        // 2. 计算菲涅尔项 (Schlick)
+        Vec F0 = make_vec(0.04f, 0.04f, 0.04f);
+        F0 = F0 * (1.0f - metallic) + albedo * metallic;
+        
+        // 使用反向光线计算视角
+        float cos_theta = fmaxf(nl.dot(r_d * -1.0f), 0.0f);
+        Vec F = fresnel_schlick(cos_theta, F0);
+        float F_avg = (F.x + F.y + F.z) / 3.0f;
+
+        // 3. 计算能量权重 (Weights)
+        
+        // 镜面反射权重: 
+        // 基础是菲涅尔(F_avg)。
+        // 乘以 粗糙度衰减系数 (spec_attenuation)。
+        // 结果: 粗糙墙面的 w_spec 会变得极小，概率极低。
+        float w_spec = F_avg * spec_attenuation;
+
+        // 透射权重:
+        // 基础是 (1-F) * transmission。
+        // 同样受粗糙度影响 (可选，磨砂玻璃透光性也会变差/变散)。
+        float w_trans = (1.0f - F_avg) * transmission;
+        
+        // 漫反射权重:
+        // 基础是 (1-F) * (1-transmission)。
+        // 乘以 金属抑制系数 (diffuse_suppression)。
+        // 乘以 Albedo 亮度 (黑色的东西漫反射概率低)。
+        float albedo_lum = fmaxf(albedo.x, fmaxf(albedo.y, albedo.z));
+        float w_diff = (1.0f - F_avg) * (1.0f - transmission) * diffuse_suppression * albedo_lum;
+
+        // 4. 归一化为概率 (PDF)
+        float sum = w_spec + w_trans + w_diff;
+        
+        // 防止除以零 (如果全黑且全吸收)
+        if (sum < 1e-5f) {
+            // 给一个默认值，或者结束
+            w_diff = 1.0f; sum = 1.0f; 
+        }
+
+        float p_spec = w_spec / sum;
+        float p_trans = w_trans / sum;
 
         // --- 3. 俄罗斯轮盘赌 ---
         if (depth > RR_THRESHOLD) {
@@ -416,28 +563,13 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
             if (curand_uniform(&state) < p) throughput = throughput * (1.0f / p);
             else break;
         }
-        
-        // =========================================================
-        // [PBR 光路选择]
-        // =========================================================
-        
-        // 计算 F0 (垂直反射率)
-        // 金属: F0 = Albedo
-        // 非金属: F0 = 0.04 (线性灰色)
-        Vec F0 = make_vec(0.04f, 0.04f, 0.04f);
-        F0 = F0 * (1.0f - metallic) + albedo * metallic;
-
-        // 计算当前角度的菲涅尔反射率 F
-        // 注意：需要使用 View 向量 (反向光线)
-        float cos_theta = fmaxf(nl.dot(r_d * -1.0f), 0.0f);
-        Vec F = fresnel_schlick(cos_theta, F0);
-        float p_spec = (F.x + F.y + F.z) / 3.0f; // 平均反射概率
 
         float rnd = curand_uniform(&state);
 
         // --- 分支 A: 镜面反射 (Specular) ---
         // 概率: p_spec (由菲涅尔决定)
         if (rnd < p_spec) {
+
             Vec perfect = r_d - n * 2 * n.dot(r_d);
             r_d = sample_rough_reflection(perfect, roughness, &state);
             
@@ -449,13 +581,15 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
             // F / p_spec 近似为 1 (如果是白色 F)。
             // 严谨写法: throughput = throughput * F * (1.0f / p_spec);
             // 简单写法 (假设 F 是颜色):
-            throughput = throughput.mult(F) * (1.0f / p_spec);
+            float weight = 1.0f / p_spec;
+            throughput = throughput.mult(F) * weight;
 
             r_o = x_hit + nl * 1e-3f;
+            prev_refl_mode = SPEC;
         }
         // --- 分支 B: 透射 (Transmission / Glass) ---
         // 概率: (1 - p_spec) * transmission
-        else if (rnd < p_spec + (1.0f - p_spec) * transmission) {
+        else if (rnd < p_spec + p_trans) {
             // 1. 准备物理参数
             bool into = n.dot(nl) > 0; // 检查是射入还是射出
             float nc = 1.0f;           // 空气 IOR
@@ -510,13 +644,71 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
             if (p_branch > 1e-4f) {
                 throughput = throughput.mult(albedo) * (1.0f / p_branch);
             }
+            prev_refl_mode = REFR; 
         }
         // --- 分支 C: 漫反射 (Diffuse) ---
         // 概率: 剩余部分
         else {
-            // 金属没有漫反射
-            if (metallic > 0.9f) break; 
 
+            // -----------------------------------------------------
+            // [NEE] 显式光源采样
+            // -----------------------------------------------------
+            // 只有当表面是漫反射时，NEE 收益才大。
+            if (light_count > 0) {
+                // 1. 随机选灯
+                int l_idx = (int)(curand_uniform(&state) * (light_count - 0.001f));
+                const Object& light = scene_objects[light_indices[l_idx]]; // 注意用 scene_objects 指针
+
+                // 2. 在灯上选点 (三角形均匀采样)
+                float r1 = curand_uniform(&state);
+                float r2 = curand_uniform(&state);
+                float sqr1 = sqrtf(r1);
+                float u = 1.0f - sqr1;
+                float v = sqr1 * (1.0f - r2);
+                // float w = sqr1 * r2; (1-u-v)
+                Vec light_pos = light.v0 * u + light.v1 * v + light.v2 * (1.0f - u - v);
+
+                // 3. 连线
+                Vec to_light = light_pos - x_hit;
+                float dist_sq = to_light.dot(to_light);
+                if (dist_sq < 5) dist_sq = 5;
+                float dist = sqrtf(dist_sq);
+                Vec L_dir = to_light * (1.0f / dist);
+
+                // 4. 几何检查
+                float cos_theta = nl.dot(L_dir); // 表面是否朝向灯
+                
+                // 计算灯的法线
+                Vec le1 = light.v1 - light.v0;
+                Vec le2 = light.v2 - obj.v0; // 哎呀，这里要把 light.v0 写对
+                // 其实可以直接在 Object 里存法线，或者现算
+                Vec light_n = (light.v1 - light.v0).cross(light.v2 - light.v0).norm();
+                float cos_light = -light_n.dot(L_dir); // 灯是否朝向表面
+
+                if (cos_theta > 0.0f && cos_light > 0.0f) {
+                    // 5. 阴影光线测试 (Shadow Ray)
+                    // 注意：这里要传入 bvh_nodes 和 scene_objects
+                    // 还要注意：trace_shadow 的 t_max 应该是 dist - 0.01 (稍微短一点，别打中灯自己)
+                    if (!trace_shadow(x_hit + nl * 1e-3f, L_dir, dist - 1e-2f, bvh_nodes, scene_objects)) {
+                        
+                        // 6. 计算贡献
+                        float area = triangle_area(light);
+                        float pdf = 1.0f / (area * light_count); // 选这个点的概率密度
+                        
+                        // Geometry Term G = (cos_theta * cos_light) / dist^2
+                        float G = (cos_theta * cos_light) / dist_sq;
+                        
+                        // BRDF (漫反射) = albedo / PI
+                        Vec brdf = albedo * (1.0f / M_PI);
+                        
+                        // L_direct = Le * BRDF * G / PDF
+                        Vec contribution = light.emission.mult(brdf) * (G / pdf);
+                        
+                        // 累加到 radiance
+                        radiance = radiance + throughput.mult(contribution);
+                    }
+                }
+            }
             // 漫反射颜色: 非金属才有
             Vec diffuse = albedo * (1.0f - metallic);
 
@@ -533,19 +725,34 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
             // 能量更新
             // throughput *= diffuse / (1 - p_spec - p_trans)
             float p_diff = 1.0f - p_spec - (1.0f - p_spec) * transmission;
-            throughput = throughput.mult(diffuse) * (1.0f / p_diff);
+            float weight = 1.0f / p_diff;
+            throughput = throughput.mult(diffuse) * weight; 
 
             r_o = x_hit + nl * 1e-3f;
+            prev_refl_mode = DIFF; 
         }
         
     }
-    
-    // [修复 2] NaN/Inf 检查 (防火墙)
-    // 只要 RGB 任何一个通道坏了，这次采样就作废，不要污染缓冲区
+
+        // [修复] 终极防火墙：过滤 NaN 和 Inf
+    // 只要 RGB 任何一个分量坏了，这一帧的采样就直接作废，不要污染历史数据。
     if (isnan(radiance.x) || isnan(radiance.y) || isnan(radiance.z) ||
         isinf(radiance.x) || isinf(radiance.y) || isinf(radiance.z)) {
-        // 这是一个坏点，什么都不加，直接返回
-        return;
+        return; // 直接丢弃这次采样
+    }
+
+    // [修复] 负值过滤
+    // 某些极端情况下（如法线插值错误），可能算出负能量，这也会搞坏累加器
+    if (radiance.x < 0.0f) radiance.x = 0.0f;
+    if (radiance.y < 0.0f) radiance.y = 0.0f;
+    if (radiance.z < 0.0f) radiance.z = 0.0f;
+
+    // [修复] 亮度钳制 (Firefly Clamp)
+    // 防止单帧超高亮度破坏平均值
+    float max_lum = 100.0f; 
+    float lum = radiance.x * 0.21 + radiance.y * 0.71 + radiance.z * 0.07;
+    if (lum > max_lum) {
+        radiance = radiance * (max_lum / lum);
     }
     
     // 写入显存
@@ -559,5 +766,5 @@ void launch_render_kernel(Vec* accum_buffer, int width, int height, int frame_se
     dim3 blocks((width + tx - 1) / tx, (height + ty - 1) / ty);
     
     // 将全局变量 d_bvh_nodes 传进去
-    render_kernel_impl<<<blocks, threads>>>(accum_buffer, width, height, frame_seed, cam, d_bvh_nodes);
+    render_kernel_impl<<<blocks, threads>>>(accum_buffer, width, height, frame_seed, cam, d_bvh_nodes, d_objects_ptr, d_light_indices, d_light_count);
 }
