@@ -34,6 +34,8 @@ struct Object {
     // 为了支持网格模型，我们需要存储三个顶点。
     Vec v0, v1, v2; 
 
+    Vec vn0, vn1, vn2; // [新增] 顶点法线 (用于平滑插值)
+
     // [材质属性]
     Vec albedo;   // 原来的 color。非金属的漫反射颜色 / 金属的反射颜色
     Vec emission; // 自发光强度 (Light Source)
@@ -48,9 +50,11 @@ struct Object {
 
     // 还需要存纹理ID，这得另起一行了
     int tex_id; 
+    int use_smooth;    // [新增] 1=使用平滑插值, 0=使用面法线
     
-    // 填充 12 字节 (3个float) 保持 16 字节对齐
-    float pad1, pad2, pad3;
+    // --- 3. 填充 (凑齐 160 字节) ---
+    float pad1;
+    float pad2;
 
 };
 
