@@ -94,7 +94,7 @@ Scene create_cornell_box() {
     scene.objects.push_back({
         .v0={-50,0,0}, .v1={50,0,600}, .v2={150,0,0}, 
         .albedo=white, .emission=black, .metallic=wall_mat.m, .roughness=wall_mat.r, .ior=wall_mat.i, .transmission=wall_mat.t, .tex_id=-1});
-    
+
     // 2. 天花板 (y=100)
     scene.objects.push_back({
         .v0={-50,100,0}, .v1={150,100,0}, .v2={50,100,600}, 
@@ -103,7 +103,7 @@ Scene create_cornell_box() {
     // 3. 后墙 (z=0)
     scene.objects.push_back({
         .v0={-50,0,0}, .v1={150,0,0}, .v2={50,200,0}, 
-        .albedo=white, .emission=black, .metallic=wall_mat.m, .roughness=wall_mat.r, .ior=wall_mat.i, .transmission=wall_mat.t, .tex_id=0});
+        .albedo=white, .emission=black, .metallic=wall_mat.m, .roughness=wall_mat.r, .ior=wall_mat.i, .transmission=wall_mat.t, .tex_id=-1});
 
     // 3. 后墙 (z=0)
     scene.objects.push_back({
@@ -128,13 +128,14 @@ Scene create_cornell_box() {
     // --- 外部模型 (Mesh) ---
     // 调用 loader 模块来加载 cube.obj 文件
     // 参数: 文件名, 目标容器, 位置偏移, 缩放大小, 颜色, 材质
-    // load_obj("assets/cube.obj", scene.objects, 
-    //          {70, 15, 40}, 
-    //          15.0f, 
+    // load_obj("assets/teapot.obj", scene.objects, 
+    //          {70, 10, 40}, 
+    //          10.0f, 
     //          {0.0f, -20.0f, 0.0f},
     //          {1.0f, 1.0f, 1.0f}, // 玻璃本身是白/透的
-    //          0.0f, 0.0f,         // 非金属，光滑
-    //          0.0f, 0.45f);       // [新功能] 透射=1.0, 折射率=1.45
+    //          0.0f, 1.0f         // 非金属，光滑
+    //          );       // [新功能] 透射=1.0, 折射率=1.45
+             // 1.0f, 1.45f);       // [新功能] 透射=1.0, 折射率=1.45
     // 打印场景信息
     printf("[Scene] Scene created with %lu objects.\n", scene.objects.size());
     return scene;

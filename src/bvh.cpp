@@ -2,27 +2,22 @@
 #include <algorithm>
 #include <iostream>
 
-// [计算中心点]
-// 用于 BVH 排序和划分 (Sorting / Splitting)
+// 获取物体的中心点 (用于排序)
 Vec get_centroid(const Object& obj) {
-    // 三角形重心:中心点 = 三个顶点的平均值
+    // 三角形重心
     return (obj.v0 + obj.v1 + obj.v2) * 0.333333f;
 }
 
-// [计算包围盒 AABB]
-// 用于生成树节点
+// 获取物体的 AABB
 AABB get_object_bounds(const Object& obj) {
     AABB box = AABB::empty();
 
-    // 扩展盒子以包含三角形的三个顶点
     box.grow(obj.v0);
     box.grow(obj.v1);
     box.grow(obj.v2);
 
-    // [关键修复]: 防止扁平三角形导致 AABB 厚度为 0
-    // 如果 AABB 在某个轴上厚度为 0 (例如平整的墙壁或灯板)，
-    // 光线求交时的数学计算 (0 * inf) 会产生 NaN，导致黑洞或漏光。
-    // 我们强制给它撑大一点点 (Padding)。
+    // [关键修复] 防止扁平三角形导致 AABB 厚度为 0 (数学黑洞)
+    // 给每个轴加一个微小的厚度 (Padding)
     const float pad = 1e-3f;
     Vec size = box.max - box.min;
     
@@ -42,8 +37,7 @@ void BVH::build(std::vector<Object>& objects) {
 
     if (objects.empty()) return;
 
-    // 启动递归构建
-    // 这会重新排序 objects 数组，使其内存布局对缓存更友好
+    // 开始递归构建
     printf("[BVH] Building BVH for %lu objects...\n", objects.size());
     build_recursive(objects, 0, objects.size());
     
@@ -70,13 +64,10 @@ int BVH::build_recursive(std::vector<Object>& objects, int start, int end) {
 
     // 3. 递归终止条件 (叶子节点)
     // 如果只剩 1 个物体，这就必须是叶子了
-    // 进阶优化：可以让叶子包含多个物体 (比如 <= 4)，减少树深度。
     if (n_objs == 1) {
-        nodes[node_idx].left_child_idx = -1; // 无子节点
-        nodes[node_idx].right_child_idx = -1;
+        nodes[node_idx].is_leaf = 1;
         nodes[node_idx].primitive_offset = start;
         nodes[node_idx].primitive_count = n_objs;
-        nodes[node_idx].is_leaf = 1;
         return node_idx;
     }
 
@@ -113,12 +104,10 @@ int BVH::build_recursive(std::vector<Object>& objects, int start, int end) {
     int right_idx = build_recursive(objects, mid, end);
 
     // 8. 填充内部节点数据
-    // 注意：由于递归过程中 nodes vector 可能会扩容，导致之前的引用/指针失效
-    // 所以我们通过索引访问 nodes[node_idx] 是安全的
+    // 注意：vector 可能扩容了，重新获取引用
     nodes[node_idx].is_leaf = 0; 
     nodes[node_idx].left_child_idx = left_idx; 
     nodes[node_idx].right_child_idx = right_idx; 
-    nodes[node_idx].primitive_count = 0;
 
     return node_idx;
 }
