@@ -129,7 +129,7 @@ __device__ inline bool trace_shadow(const Vec& origin, const Vec& dir, float max
         }
 
         // [叶子节点]
-        if (node.primitive_count > 0) { // count > 0 表示是叶子 (根据 bvh.h 定义)
+        if (node.is_leaf) { // count > 0 表示是叶子 (根据 bvh.h 定义)
             for (int k = 0; k < node.primitive_count; k++) {
                 int obj_idx = node.primitive_offset + k;
                 
