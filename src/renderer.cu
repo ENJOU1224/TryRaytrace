@@ -360,7 +360,7 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
     // -----------------------------------------------------------
     Vec throughput = make_vec(1, 1, 1);
     Vec radiance = make_vec(0, 0, 0);
-    const int MAX_DEPTH = 30;
+    const int MAX_DEPTH = 10;
     const int RR_THRESHOLD = 3;
     Refl_t prev_refl_mode = SPEC;
 
@@ -441,6 +441,28 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         Vec e1 = obj.v1 - obj.v0;
         Vec e2 = obj.v2 - obj.v0;
         Vec n = e1.cross(e2).norm();
+
+        // 2. [新增] 如果启用了平滑，计算插值法线
+        if (obj.use_smooth) {
+            // 需要重心坐标 (u, v, w)
+            // 既然 intersect 只返回了 t，我们这里为了省显存带宽不存 u/v，直接重算一遍
+            // (MT算法很快，重算比读取显存更值)
+            
+            // ... (复制 Möller–Trumbore 的前半部分算 u, v) ...
+            Vec h = r_d.cross(e2);
+            float a = e1.dot(h);
+            float f = 1.0f / a;
+            Vec s = r_o - obj.v0;
+            float u = f * s.dot(h);
+            Vec q = s.cross(e1);
+            float v = f * r_d.dot(q);
+            float w = 1.0f - u - v;
+
+            // 插值公式: N = w*n0 + u*n1 + v*n2
+            n = obj.vn0 * w + obj.vn1 * u + obj.vn2 * v;
+            n.norm(); // 插值后长度可能变短，必须重新归一化
+        }
+
 
         // 确保法线朝向观察者 (双面渲染)
         Vec nl = n.dot(r_d) < 0 ? n : n * -1;
