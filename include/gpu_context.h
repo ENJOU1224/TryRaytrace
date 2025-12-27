@@ -1,4 +1,9 @@
 #pragma once // 防止头文件重复包含
+#include <vector>
+#include <string>
+
+// 引入必要的结构体定义
+#include "common.h"
 
 // 引入场景定义，我们需要 Object 和 CameraParams 结构体
 #include "scene.h"

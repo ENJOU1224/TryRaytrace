@@ -22,29 +22,29 @@
 #include "common.h"     // 基础数据结构 (Vec)
 #include "scene.h"      // 场景数据定义
 #include "camera.h"     // 相机控制逻辑
-#include "renderer.h"   // GPU 渲染接口
+#include "gpu_context.h"   // GPU 渲染接口
 #include "pipeline.h"   // CPU 后台处理流水线
 #include "input.h"      // 输入管理
 #include "image_io.h"   // 文件保存
 #include "bvh.h"        // bvh
 
-// 1. 定义一个全局原子标志位
+// // 1. 定义一个全局原子标志位
 std::atomic<bool> quit(false);
 
-// 2. 信号处理函数：只负责修改标志位
-void signal_handler(int signal) {
-    if (signal == SIGINT) {
-        quit = true; // 告诉主循环停止运行
-    }
-}
+// // 2. 信号处理函数：只负责修改标志位
+// void signal_handler(int signal) {
+//     if (signal == SIGINT) {
+//         quit = true; // 告诉主循环停止运行
+//     }
+// }
 
 // ======================================================================================
 // 主函数入口
 // ======================================================================================
 int main(int argc, char** argv) {
-    std::signal(SIGINT, signal_handler);
+    // std::signal(SIGINT, signal_handler);
     // ------------------------------------------------------------------
-    // 1. 系统配置
+    // 1. 窗口与图形环境初始化
     // ------------------------------------------------------------------
     int w = 1200; // 窗口宽度
     int h = 800;  // 窗口高度
@@ -71,20 +71,22 @@ int main(int argc, char** argv) {
     SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
 
     // ------------------------------------------------------------------
-    // 2. 模块初始化
+    // 2. 场景构建与数据处理
     // ------------------------------------------------------------------
-    
+
+    // [A] 创建场景数据
     // [场景模块]: 创建 Cornell Box 场景数据
     // 工厂模式：scene.cpp 负责生产数据，main 只负责拿到 Scene 对象
     Scene scene = create_cornell_box();
     
-    // [新增] 构建 BVH
+    // [B] 构建 BVH (关键步骤)
     // 注意：这一步会打乱 scene.objects 的顺序！
     // 所以必须在 init_scene_data 之前做。
     BVH bvh;
     bvh.build(scene.objects);
 
-    // [新增] 筛选光源
+    // [C] 提取光源 (必须在 BVH 构建之后!)
+    // 因为 objects 顺序变了，必须现在重新遍历一遍，找出哪个是灯
     std::vector<int> light_indices;
     for (size_t i = 0; i < scene.objects.size(); i++) {
         // 只要发光强度 > 0，就认为是灯
@@ -94,19 +96,20 @@ int main(int argc, char** argv) {
             light_indices.push_back((int)i);
         }
     }
+    printf("[Main] Found %lu lights after BVH sort.\n", light_indices.size());
 
 
-    // [渲染模块]: 将场景数据上传到 GPU 全局内存
-    // 传入 light_indices
+    // [D] 上传数据到 GPU 全局内存
     init_scene_data(scene.objects, scene.texture_files, bvh.get_nodes(), light_indices);
 
+    // ------------------------------------------------------------------
+    // 3. 运行时资源初始化
+    // ------------------------------------------------------------------
     // [相机模块]: 初始化第一人称相机
-    // 参数: 初始位置 (50, 52, 295.6), 初始朝向 (0, -0.04, -1)
+    // 参数: 初始位置 (50, 52, 295.6), 初始朝向 (0, 0, -1)
     CameraController cam({50, 50, 295.6}, {0, 0, -1});
 
-    // ------------------------------------------------------------------
-    // 3. 内存与显存分配 (双缓冲架构的核心)
-    // ------------------------------------------------------------------
+    // 显存/内存分配
     size_t size_bytes = w * h * sizeof(Vec);
     
     // [显存 - Buffer A]: 累加缓冲区 (Accumulation Buffer)
@@ -131,9 +134,7 @@ int main(int argc, char** argv) {
     // 存放最终转换好的 ARGB 像素数据
     uint32_t* pixel_buffer = (uint32_t*)malloc(w * h * sizeof(uint32_t));
 
-    // ------------------------------------------------------------------
-    // 4. 启动流水线
-    // ------------------------------------------------------------------
+    // 启动流水线
     // 初始化 Pipeline 对象，这会启动一个后台 Worker 线程，处于待命状态
     Pipeline pipe;
     pipeline_init(&pipe, h_accum, d_staging, pixel_buffer, w, h);
@@ -143,11 +144,12 @@ int main(int argc, char** argv) {
     InputManager input; 
 
     // ------------------------------------------------------------------
-    // 5. 游戏主循环 (Game Loop)
+    // 4. 渲染主循环
     // ------------------------------------------------------------------
     
     int gpu_frame = 1; // 当前 GPU 正在累积第几帧
     quit = false;
+    SDL_Event e; // 仅用于 Poll 内部机制，实际处理交给 InputManager
 
     while (!quit) {
         
@@ -224,7 +226,7 @@ int main(int argc, char** argv) {
     save_snapshot(h_accum, w, h, gpu_frame, cam.get_focus_dist(), cam.get_aperture()); 
 
     // ------------------------------------------------------------------
-    // 6. 资源清理 (Cleanup)
+    // 5. 资源清理 (Cleanup)
     // ------------------------------------------------------------------
     // 销毁流水线 (会等待后台线程安全退出)
     pipeline_destroy(&pipe);

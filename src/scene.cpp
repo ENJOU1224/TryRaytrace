@@ -1,16 +1,51 @@
 #include "scene.h"
 #include "loader.h" // 引入 OBJ 加载器
 
-// 辅助函数: 添加一个矩形 (2个三角形)
-// p0, p1, p2, p3 逆时针顺序
-void add_quad(Scene& scene, Vec p0, Vec p1, Vec p2, Vec p3, Vec color, Vec emission, Refl_t refl) {
+// ======================================================================================
+// 辅助函数: 添加一个矩形 (Quad)
+// ======================================================================================
+// 一个矩形 = 两个三角形
+// p0 -- p1
+// |      |
+// p3 -- p2
+// 
+// 自动计算面法线，并分配标准的 UV (0,0 -> 1,1)
+void add_quad(Scene& scene, 
+              Vec p0, Vec p1, Vec p2, Vec p3, 
+              Vec color, Vec emission, 
+              float metallic, float roughness, int tex_id = -1) {
+    
+    // 1. 计算法线 (平面法线是固定的)
+    // 假设点是逆时针排列的
+    Vec e1 = p1 - p0;
+    Vec e2 = p3 - p0;
+    Vec n = e1.cross(e2).norm();
+
+    // 2. 三角形 1 (p0 -> p1 -> p2)
+    // 对应 UV: (0,1) -> (1,1) -> (1,0)  <-- 根据纹理坐标系调整，这里假设左下角是0,0
+    // 实际上 PPM 纹理坐标通常 (0,0) 在左上。为了简单，我们先映射满整个图。
     scene.objects.push_back({
-        .v0=p0, .v1=p1, .v2=p2, 
+        .v0=p0, .v1=p1, .v2=p2,
+        .vn0=n, .vn1=n, .vn2=n,          // 平面法线一致
+        .albedo=color, .emission=emission,
+        .uv0={0,0}, .uv1={1,0}, .uv2={1,1}, // UV 映射
+        .metallic=metallic, .roughness=roughness, 
+        .ior=1.45f, .transmission=0.0f,
+        .tex_id=tex_id, .use_smooth=0    // 墙壁不需要平滑插值
     });
+
+    // 3. 三角形 2 (p0 -> p2 -> p3)
     scene.objects.push_back({
-        .v0=p0, .v1=p2, .v2=p3, 
+        .v0=p0, .v1=p2, .v2=p3,
+        .vn0=n, .vn1=n, .vn2=n,
+        .albedo=color, .emission=emission,
+        .uv0={0,0}, .uv1={1,1}, .uv2={0,1}, // UV 映射
+        .metallic=metallic, .roughness=roughness,
+        .ior=1.45f, .transmission=0.0f,
+        .tex_id=tex_id, .use_smooth=0
     });
 }
+
 // ======================================================================================
 // 工厂函数: create_cornell_box()
 // ======================================================================================
@@ -93,31 +128,14 @@ Scene create_cornell_box() {
     // --- 外部模型 (Mesh) ---
     // 调用 loader 模块来加载 cube.obj 文件
     // 参数: 文件名, 目标容器, 位置偏移, 缩放大小, 颜色, 材质
-    load_obj("assets/cow.obj", scene.objects, 
-             {50.0f, 25.0f, 50.0f}, // 位置: 放在盒子中间偏上
-             8.0f,                 // 缩放: 模型原始大小是 -1到1，放大10倍
-             white,    // 颜色: 金色
-             0.0f,                  // 材质: 镜面
-             0.0f);                 
-
+    // load_obj("assets/cube.obj", scene.objects, 
+    //          {70, 15, 40}, 
+    //          15.0f, 
+    //          {0.0f, -20.0f, 0.0f},
+    //          {1.0f, 1.0f, 1.0f}, // 玻璃本身是白/透的
+    //          0.0f, 0.0f,         // 非金属，光滑
+    //          0.0f, 0.45f);       // [新功能] 透射=1.0, 折射率=1.45
     // 打印场景信息
     printf("[Scene] Scene created with %lu objects.\n", scene.objects.size());
-
-    scene.world_bound = AABB::empty();
-    
-    for (const auto& obj : scene.objects) {
-      scene.world_bound.grow(obj.v0);
-      scene.world_bound.grow(obj.v1);
-      scene.world_bound.grow(obj.v2);
-    }
-
-    // 稍微把盒子往外扩一点点 (Epsilon)，防止刚好贴边导致误判
-    scene.world_bound.min = scene.world_bound.min - make_vec(0.1f, 0.1f, 0.1f);
-    scene.world_bound.max = scene.world_bound.max + make_vec(0.1f, 0.1f, 0.1f);
-
-    printf("[Scene] World Bound: Min(%.1f, %.1f, %.1f) Max(%.1f, %.1f, %.1f)\n",
-           scene.world_bound.min.x, scene.world_bound.min.y, scene.world_bound.min.z,
-           scene.world_bound.max.x, scene.world_bound.max.y, scene.world_bound.max.z);
-
     return scene;
 }
