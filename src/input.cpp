@@ -68,6 +68,14 @@ InputState InputManager::process_events(CameraController& cam) {
             }
         }
 
+        // [新增] 滚轮事件
+        if (e.type == SDL_MOUSEWHEEL) {
+            // e.wheel.y: 垂直滚动量 (通常是 1 或 -1)
+            if (cam.process_scroll(e.wheel.y)) {
+                state.camera_moved = true; // 触发重置
+            }
+        }
+
         // [键盘按键事件 (单次触发)]
         // 适用于开关型操作 (Toggle) 或 单次指令 (Command)
         if (e.type == SDL_KEYDOWN) {

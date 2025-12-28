@@ -65,9 +65,11 @@ int BVH::build_recursive(std::vector<Object>& objects, int start, int end) {
     // 3. 递归终止条件 (叶子节点)
     // 如果只剩 1 个物体，这就必须是叶子了
     if (n_objs == 1) {
-        nodes[node_idx].is_leaf = 1;
+        nodes[node_idx].left_child_idx = -1; // 无子节点
+        nodes[node_idx].right_child_idx = -1; // 无子节点
         nodes[node_idx].primitive_offset = start;
         nodes[node_idx].primitive_count = n_objs;
+        nodes[node_idx].is_leaf = 1;
         return node_idx;
     }
 
@@ -108,6 +110,7 @@ int BVH::build_recursive(std::vector<Object>& objects, int start, int end) {
     nodes[node_idx].is_leaf = 0; 
     nodes[node_idx].left_child_idx = left_idx; 
     nodes[node_idx].right_child_idx = right_idx; 
+    // nodes[node_idx].primitive_count = 0;
 
     return node_idx;
 }

@@ -14,10 +14,11 @@
 // transmission:  透明度
 // ior:           折射率
 // tex_id:        纹理编号
+// smooth:        平滑 
 void load_obj(const char* filename, std::vector<Object>& objects, 
               Vec offset, float scale, Vec rotation, // [新增] rotation
               Vec albedo, float metallic, float roughness, float transmission = 0.0f, float ior = 1.45f,
-              int tex_id = -1);
+              int tex_id = -1, bool smooth = true);
 
 // ppm 图片加载函数
 // filename:  文件路径

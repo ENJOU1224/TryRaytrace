@@ -34,6 +34,11 @@ public:
     // yrel: 鼠标垂直移动距离 (控制抬头低头)
     bool process_mouse(float xrel, float yrel);
 
+    // [新增] 处理滚轮滚动
+    // yoffset: 滚轮滚动的格数 (+1 或 -1)
+    // 返回 true 表示 FOV 变了，需要重置渲染
+    bool process_scroll(float yoffset);
+
     // ------------------------------------------------------------------
     // 数据传输接口
     // ------------------------------------------------------------------
@@ -47,6 +52,9 @@ public:
     // [调试接口] 获取当前物理参数
     float get_aperture() const { return aperture; }
     float get_focus_dist() const { return focus_dist; }
+
+    // [新增] 获取当前 FOV
+    float get_fov() const { return fov; }
 
 private:
     // [内部函数] 更新相机向量
@@ -80,4 +88,8 @@ private:
     // --- 光学参数 (物理相机) ---
     float aperture = 0.0f;      // 光圈直径 (0 = 针孔相机/全清晰; 值越大背景越虚化)
     float focus_dist = 240.0f;  // 对焦距离 (相机到清晰平面的距离)
+                               
+    // [新增] 垂直视场角 (Vertical FOV)
+    // 之前硬编码的 0.5135 对应大约 54 度
+    float fov = 54.0f;
 };

@@ -79,6 +79,23 @@ bool CameraController::process_mouse(float xrel, float yrel) {
     return true; // 返回 true 告诉主程序: 相机动了，请重置渲染累积
 }
 
+// [新增] 处理滚轮
+bool CameraController::process_scroll(float yoffset) {
+    if (yoffset == 0.0f) return false;
+
+    // 滚轮向上(正)，FOV 减小 (放大)
+    // 滚轮向下(负)，FOV 增大 (广角)
+    fov -= yoffset * 2.0f; // 2.0 是缩放速度，可以自己调
+
+    // 限制范围: 1度 (极窄) 到 120度 (超广角)
+    if (fov < 1.0f) fov = 1.0f;
+    if (fov > 120.0f) fov = 120.0f;
+    
+    printf("[Cam] FOV: %.1f\n", fov); // 调试打印
+
+    return true; // 告诉主程序重置累加器
+}
+
 // ======================================================================================
 // 输入处理: 键盘移动 & 参数调整
 // ======================================================================================
@@ -144,7 +161,7 @@ CameraParams CameraController::get_params(int width, int height) {
     // 1. FOV 系数
     // 0.5135 是 tan(FOV / 2) 的值。
     // 对应垂直 FOV 约为 54.4 度 (2 * atan(0.5135))。
-    const float fov_scale = 0.5135f; 
+    float fov_scale = tan(radians(fov) * 0.5f);
     
     // 2. 纵横比 (Aspect Ratio)
     float aspect = (float)width / height;

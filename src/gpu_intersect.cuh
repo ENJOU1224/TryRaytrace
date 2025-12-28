@@ -110,13 +110,8 @@ __device__ inline bool trace_shadow(const Vec& origin, const Vec& dir, float max
     int stack[32];
     int ptr = 0;
     stack[ptr++] = 0; // 压入根节点
-                      
-    // [新增] 安全计数器
-    int safety_counter = 0;
-    const int MAX_STEPS = 200; // 阴影测试通常很快，200次遍历足够了
 
-
-    while (ptr > 0 && safety_counter++ < MAX_STEPS) {
+    while (ptr > 0) {
         // 弹出节点
         int idx = stack[--ptr];
         LinearBVHNode node = nodes[idx];

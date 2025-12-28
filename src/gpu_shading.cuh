@@ -135,11 +135,7 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         int ptr = 0;
         stack[ptr++] = 0; // 压入根节点
 
-        // [新增] 安全计数器
-        int safety_counter = 0;
-        const int MAX_STEPS = 500; // 主光线遍历次数给多一点
-
-        while (ptr > 0 && safety_counter++ < MAX_STEPS) {
+        while (ptr > 0) {
             int idx = stack[--ptr];
             LinearBVHNode node = bvh_nodes[idx];
             
@@ -152,33 +148,12 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
                     int obj_idx = node.primitive_offset + k;
                     const Object& tri = scene_objects[obj_idx];
                     
-                    // [内联 Möller–Trumbore 算法]
-                    // 为了获取重心坐标 (u,v)，这里展开写，而不调用 gpu_intersect.cuh 的 intersect
-                    // 这样可以避免重复计算
-                    Vec e1 = tri.v1 - tri.v0;
-                    Vec e2 = tri.v2 - tri.v0;
-                    Vec h = r_d.cross(e2);
-                    float a = e1.dot(h);
-                    
-                    if (a > -1e-6f && a < 1e-6f) continue; // 平行
-                    
-                    float f = 1.0f / a;
-                    Vec s = r_o - tri.v0;
-                    float u = f * s.dot(h);
-                    if (u < 0.0f || u > 1.0f) continue;
-                    
-                    Vec q = s.cross(e1);
-                    float v = f * r_d.dot(q);
-                    if (v < 0.0f || u + v > 1.0f) continue;
-                    
-                    float t = f * e2.dot(q);
+                    float t = intersect(tri, r_o, r_d);
                     
                     // 找到更近的交点
                     if (t > 0.0f && t < d_min) {
                         d_min = t;
                         id = obj_idx;
-                        hit_u = u;
-                        hit_v = v;
                     }
                 }
             } else {
@@ -195,20 +170,26 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         // --- 3.2 属性插值 (Interpolation) ---
         const Object& obj = scene_objects[id];
         Vec x_hit = r_o + r_d * d_min;
-        float w = 1.0f - hit_u - hit_v; // 重心坐标 w
+
+        Vec e1 = obj.v1 - obj.v0;
+        Vec e2 = obj.v2 - obj.v0;
+        Vec n = e1.cross(e2).norm();
 
         // [法线插值]: 实现 Phong Shading (平滑着色)
-        Vec n;
         if (obj.use_smooth) {
             // 使用顶点法线插值
-            n = obj.vn0 * w + obj.vn1 * hit_u + obj.vn2 * hit_v;
+            Vec h = r_d.cross(e2);
+            float a = e1.dot(h);
+            float f = 1.0f / a;
+            Vec s = r_o - obj.v0;
+            float u = f * s.dot(h);
+            Vec q = s.cross(e1);
+            float v = f * r_d.dot(q);
+            float w = 1.0f - u - v;
+
+            n = obj.vn0 * w + obj.vn1 * u + obj.vn2 * v;
             n.norm(); // 插值后长度可能变短，必须重新归一化
-        } else {
-            // 使用面法线 (Flat Shading)
-            Vec e1 = obj.v1 - obj.v0;
-            Vec e2 = obj.v2 - obj.v0;
-            n = e1.cross(e2).norm();
-        }
+        } 
         Vec nl = n.dot(r_d) < 0 ? n : n * -1; // 确保法线朝向光线来的一侧
 
         // [UV 插值]: 实现正确的纹理映射
@@ -227,7 +208,7 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
             // 使用插值后的 UV 直接查表
             // tex2D 提供硬件双线性插值
             float4 tex = tex2D<float4>(d_textures[obj.tex_id], tex_u, tex_v);
-            
+
             // 混合纹理颜色和基础颜色
             albedo = albedo.mult(make_vec(tex.x, tex.y, tex.z));
         }
@@ -239,16 +220,14 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         bool is_specular_bounce = (prev_refl_mode == 1) || (prev_refl_mode == 2);
         if (is_specular_bounce) {
              Vec added_light = throughput.mult(obj.emission);
-             // [高光钳制]: 如果间接光太亮(焦散)，压一下，防止萤火虫
-             if (depth > 0) {
-                 float lum = added_light.x * 0.2 + added_light.y * 0.7 + added_light.z * 0.1;
-                 if (lum > 2.0f) added_light = added_light * (2.0f / lum);
-             }
              radiance = radiance + added_light;
         }
         
         // 如果打中强光源，通常光路终止 (除非做透射光)
-        if (obj.emission.x > 0.001f) break;
+        if (obj.emission.x > 0.001f || obj.emission.y > 0.001f || obj.emission.z > 0.001f) {
+            break; 
+        }
+
 
         // --- 3.5 俄罗斯轮盘赌 (Russian Roulette) ---
         if (depth > RR_THRESHOLD) {
@@ -259,30 +238,48 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         }
 
         // --- 3.6 PBR 能量权重计算 ---
+        // 1. 准备菲涅尔参数
         Vec F0 = make_vec(0.04f, 0.04f, 0.04f);
         F0 = F0 * (1.0f - metallic) + albedo * metallic;
+        
+        // 使用反向光线计算视角余弦
         float cos_theta = fmaxf(nl.dot(r_d * -1.0f), 0.0f);
         Vec F = fresnel_schlick(cos_theta, F0);
         float F_avg = (F.x + F.y + F.z) / 3.0f;
 
-        float w_spec = F_avg;
-        float w_trans = (1.0f - w_spec) * transmission;
-        float w_diff = (1.0f - w_spec) * (1.0f - transmission);
-
-        // [金属修正]: 金属没有漫反射和透射
-        if (metallic > 0.9f) { w_diff = 0.0f; w_trans = 0.0f; w_spec = 1.0f; }
+        // 2. 计算非线性抑制系数
         
-        // [粗糙度修正]: 粗糙非金属抑制镜面，防止白点
-        if (metallic < 0.1f && roughness > 0.4f) {
-            float transfer = (roughness - 0.4f) / 0.6f;
-            if (transfer > 1.0f) transfer = 1.0f;
-            float energy_to_move = w_spec * transfer;
-            w_spec -= energy_to_move;
-            w_diff += energy_to_move;
-        }
+        // [漫反射抑制]: 金属度越高，漫反射权重呈指数级下降
+        // 0.0 -> 1.0;  0.5 -> 0.125;  1.0 -> 0.0
+        float diffuse_scale = powf(1.0f - metallic, 2.0f);
 
+        // [镜面反射抑制]: 粗糙度越高，镜面反射权重下降 (仅针对非金属!)
+        // 原始衰减: 1.0 - r^2 (粗糙度1.0时衰减为0)
+        float spec_scale = 1.0f - (roughness * roughness);
+        if (spec_scale < 0.0f) spec_scale = 0.0f;
+
+        // 3. 计算基础能量权重
+        
+        // 镜面: 菲涅尔 * 抑制系数
+        float w_spec = F_avg * spec_scale;
+        
+        // 透射: (1-F) * 透射度
+        // (玻璃通常比较光滑，暂时不做粗糙度抑制，或者可以复用 spec_scale)
+        float w_trans = (1.0f - F_avg) * transmission;
+        
+        // 漫反射: (1-F) * (1-透射) * 亮度 * 抑制系数
+        // 引入 albedo 亮度权重: 如果物体是黑色的，就少采样漫反射
+        float albedo_lum = fmaxf(albedo.x, fmaxf(albedo.y, albedo.z));
+        float w_diff = (1.0f - F_avg) * (1.0f - transmission) * albedo_lum * diffuse_scale;
+
+        // 4. 归一化为概率 (PDF)
         float sum = w_spec + w_trans + w_diff;
-        if (sum < 1e-4f) break; // 被完全吸收
+        
+        // 防止除以零 (极暗物体)
+        if (sum < 1e-6f) {
+            // 默认全给漫反射或者结束
+             w_diff = 1.0f; sum = 1.0f;
+        }
 
         float p_spec = w_spec / sum;
         float p_trans = w_trans / sum;
@@ -301,8 +298,7 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
 
             // 权重: w_spec / p_spec * F_color_factor
             float weight = 1.0f / p_spec;
-            if (weight > 10.0f) weight = 10.0f;
-            throughput = throughput.mult(F) * weight * sum; 
+            throughput = throughput.mult(F) * weight ; 
 
             r_o = x_hit + nl * 1e-3f; // 往外推
             prev_refl_mode = 1; // SPEC
@@ -343,15 +339,13 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
             }
             
             float weight = 1.0f / p_trans;
-            if (weight > 10.0f) weight = 10.0f;
-            throughput = throughput.mult(albedo) * weight * sum;
+            throughput = throughput.mult(albedo) * weight;
             prev_refl_mode = 2; // REFR
         }
         // =========================================================
         // 分支 C: 漫反射 (Diffuse + NEE)
         // =========================================================
         else {
-            if (metallic > 0.9f) break; // 金属不应该来这里，双重保险
             
             // --- NEE (直接光照采样) ---
             if (light_count > 0 && roughness > 0.1f) {
@@ -368,7 +362,6 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
                 // 3. 几何因子
                 Vec to_light = light_pos - x_hit;
                 float dist_sq = to_light.dot(to_light);
-                if (dist_sq < 2.0f) dist_sq = 2.0f; // 距离钳制 (防除以0)
                 float dist = sqrtf(dist_sq);
                 Vec L_dir = to_light * (1.0f / dist);
                 
@@ -406,28 +399,24 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
             r_d = (u_vec * cosf(r1) * r2s + v_vec * sinf(r1) * r2s + w * sqrtf(1 - r2)).norm();
             
             float p_diff_real = 1.0f - p_spec - p_trans;
-            if (p_diff_real > 1e-4f) {
-                 float weight = 1.0f / p_diff_real;
-                 throughput = throughput.mult(albedo) * weight * sum;
-            }
+            float weight = 1.0f / p_diff_real;
+            throughput = throughput.mult(albedo) * weight;
             r_o = x_hit + nl * 1e-3f;
             prev_refl_mode = 0; // DIFF
         }
-        
-        // 间接光能量钳制 (Indirect Clamping)
-        if (throughput.x > 3.0f) throughput.x = 3.0f;
-        if (throughput.y > 3.0f) throughput.y = 3.0f;
-        if (throughput.z > 3.0f) throughput.z = 3.0f;
     }
     
     // ------------------------------------------------------------------------
     // 5. 写入结果 (Output)
     // ------------------------------------------------------------------------
-    if (isnan(radiance.x) || isinf(radiance.x)) return;
+    if (isnan(radiance.x) || isnan(radiance.y) || isnan(radiance.z) ||
+        isinf(radiance.x) || isinf(radiance.y) || isinf(radiance.z)) {
+        return; // 直接丢弃这次采样
+    }
     
     // 智能亮度压缩 (Despeckle)
     float final_lum = radiance.x * 0.2 + radiance.y * 0.7 + radiance.z * 0.1;
-    if (final_lum > 20.0f) radiance = radiance * (20.0f / final_lum);
+    if (final_lum > 100.0f) radiance = radiance * (20.0f / final_lum);
     
     accum_buffer[i] = accum_buffer[i] + radiance;
 }

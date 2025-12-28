@@ -1,4 +1,5 @@
 #include "loader.h"
+#include "common.h"
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -60,7 +61,7 @@ Vec rotate_point(Vec p, Vec r) {
 void load_obj(const char* filename, std::vector<Object>& objects, 
               Vec offset, float scale, Vec rotation, // [新增]
               Vec albedo, float metallic, float roughness, float transmission, float ior,
-              int tex_id) {
+              int tex_id, bool smooth) {
     
     // 打开文件 (只读模式)
     FILE* file = fopen(filename, "r");
@@ -131,42 +132,42 @@ void load_obj(const char* filename, std::vector<Object>& objects,
 
     fclose(file);
     
-    // 2. 自动计算平滑法线 (Vertex Normal Averaging)
-    // 因为你的 OBJ 没有 vn 数据，我们需要自己算
-    printf("[Loader] Computing smooth normals for %lu faces...\n", temp_faces.size());
+      // 2. 自动计算平滑法线 (Vertex Normal Averaging)
+      // 因为你的 OBJ 没有 vn 数据，我们需要自己算
+      printf("[Loader] Computing smooth normals for %lu faces...\n", temp_faces.size());
 
-    // 创建一个累加器，大小等于顶点数，初始化为 0
-    std::vector<Vec> vertex_normals(temp_vertices.size(), {0,0,0});
+      // 创建一个累加器，大小等于顶点数，初始化为 0
+      std::vector<Vec> vertex_normals(temp_vertices.size(), {0,0,0});
 
-    // 遍历所有面，计算面法线，并累加到对应的顶点上
-    for (const auto& face : temp_faces) {
-        // 安全检查
-        if (face.v[0] >= temp_vertices.size() || 
-            face.v[1] >= temp_vertices.size() || 
-            face.v[2] >= temp_vertices.size()) continue;
+      // 遍历所有面，计算面法线，并累加到对应的顶点上
+      for (const auto& face : temp_faces) {
+          // 安全检查
+          if (face.v[0] >= temp_vertices.size() || 
+              face.v[1] >= temp_vertices.size() || 
+              face.v[2] >= temp_vertices.size()) continue;
 
-        Vec p0 = temp_vertices[face.v[0]];
-        Vec p1 = temp_vertices[face.v[1]];
-        Vec p2 = temp_vertices[face.v[2]];
+          Vec p0 = temp_vertices[face.v[0]];
+          Vec p1 = temp_vertices[face.v[1]];
+          Vec p2 = temp_vertices[face.v[2]];
 
-        // 面法线 = (p1-p0) X (p2-p0)
-        // 注意：这里不归一化。
-        // 不归一化的好处是：面积大的三角形会对顶点法线产生更大的权重贡献 (Area Weighted)，
-        // 这通常比简单的平均效果更好。
-        Vec e1 = p1 - p0;
-        Vec e2 = p2 - p0;
-        Vec face_n = e1.cross(e2); 
+          // 面法线 = (p1-p0) X (p2-p0)
+          // 注意：这里不归一化。
+          // 不归一化的好处是：面积大的三角形会对顶点法线产生更大的权重贡献 (Area Weighted)，
+          // 这通常比简单的平均效果更好。
+          Vec e1 = p1 - p0;
+          Vec e2 = p2 - p0;
+          Vec face_n = e1.cross(e2); 
 
-        // 累加到三个顶点
-        vertex_normals[face.v[0]] = vertex_normals[face.v[0]] + face_n;
-        vertex_normals[face.v[1]] = vertex_normals[face.v[1]] + face_n;
-        vertex_normals[face.v[2]] = vertex_normals[face.v[2]] + face_n;
-    }
+          // 累加到三个顶点
+          vertex_normals[face.v[0]] = vertex_normals[face.v[0]] + face_n;
+          vertex_normals[face.v[1]] = vertex_normals[face.v[1]] + face_n;
+          vertex_normals[face.v[2]] = vertex_normals[face.v[2]] + face_n;
+      }
 
-    // 归一化所有顶点法线
-    for (auto& n : vertex_normals) {
-        n.norm();
-    }
+      // 归一化所有顶点法线
+      for (auto& n : vertex_normals) {
+          n.norm();
+      }
 
     // 3. 组装 Object 数据
     // 将顶点、计算好的法线、材质参数打包进 Object
@@ -203,7 +204,7 @@ void load_obj(const char* filename, std::vector<Object>& objects,
         obj.tex_id = tex_id;
         
         // 标记: 使用平滑插值
-        obj.use_smooth = 1; 
+        obj.use_smooth = smooth; 
 
         objects.push_back(obj);
     }
