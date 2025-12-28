@@ -148,12 +148,33 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
                     int obj_idx = node.primitive_offset + k;
                     const Object& tri = scene_objects[obj_idx];
                     
-                    float t = intersect(tri, r_o, r_d);
+                    // [内联 Möller–Trumbore 算法]
+                    // 为了获取重心坐标 (u,v)，这里展开写，而不调用 gpu_intersect.cuh 的 intersect
+                    // 这样可以避免重复计算
+                    Vec e1 = tri.v1 - tri.v0;
+                    Vec e2 = tri.v2 - tri.v0;
+                    Vec h = r_d.cross(e2);
+                    float a = e1.dot(h);
+                    
+                    if (a > -1e-6f && a < 1e-6f) continue; // 平行
+                    
+                    float f = 1.0f / a;
+                    Vec s = r_o - tri.v0;
+                    float u = f * s.dot(h);
+                    if (u < 0.0f || u > 1.0f) continue;
+                    
+                    Vec q = s.cross(e1);
+                    float v = f * r_d.dot(q);
+                    if (v < 0.0f || u + v > 1.0f) continue;
+                    
+                    float t = f * e2.dot(q);
                     
                     // 找到更近的交点
                     if (t > 0.0f && t < d_min) {
                         d_min = t;
                         id = obj_idx;
+                        hit_u = u;
+                        hit_v = v;
                     }
                 }
             } else {
@@ -170,26 +191,20 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         // --- 3.2 属性插值 (Interpolation) ---
         const Object& obj = scene_objects[id];
         Vec x_hit = r_o + r_d * d_min;
-
-        Vec e1 = obj.v1 - obj.v0;
-        Vec e2 = obj.v2 - obj.v0;
-        Vec n = e1.cross(e2).norm();
+        float w = 1.0f - hit_u - hit_v; // 重心坐标 w
 
         // [法线插值]: 实现 Phong Shading (平滑着色)
+        Vec n;
         if (obj.use_smooth) {
             // 使用顶点法线插值
-            Vec h = r_d.cross(e2);
-            float a = e1.dot(h);
-            float f = 1.0f / a;
-            Vec s = r_o - obj.v0;
-            float u = f * s.dot(h);
-            Vec q = s.cross(e1);
-            float v = f * r_d.dot(q);
-            float w = 1.0f - u - v;
-
-            n = obj.vn0 * w + obj.vn1 * u + obj.vn2 * v;
+            n = obj.vn0 * w + obj.vn1 * hit_u + obj.vn2 * hit_v;
             n.norm(); // 插值后长度可能变短，必须重新归一化
-        } 
+        } else {
+            // 使用面法线 (Flat Shading)
+            Vec e1 = obj.v1 - obj.v0;
+            Vec e2 = obj.v2 - obj.v0;
+            n = e1.cross(e2).norm();
+        }
         Vec nl = n.dot(r_d) < 0 ? n : n * -1; // 确保法线朝向光线来的一侧
 
         // [UV 插值]: 实现正确的纹理映射
