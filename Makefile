@@ -39,7 +39,7 @@ CXX = g++
 # -I...           : 头文件搜索路径
 # -MMD -MP        : [工程关键] 自动生成 .d 依赖文件，修改 .h 能自动重编
 CXXFLAGS = -O3 -march=native -fopenmp -Wall -Wextra -Wno-unknown-pragmas \
-           -I$(SRC_DIR) -I$(INC_DIR) -MMD -MP
+           -I$(SRC_DIR) -I$(INC_DIR)
 
 # --- Device Compiler (CUDA) ---
 NVCC = nvcc
@@ -52,7 +52,7 @@ ARCH = -arch=sm_75
 # -Xptxas -O3     : [性能关键] 告诉 PTX 汇编器进行最高级别优化
 # --use_fast_math : [性能关键] 使用硬件内置的快速数学函数 (如 __sinf), 牺牲微小精度换取速度
 # -I...           : 头文件搜索路径
-NVCC_FLAGS = -O3 $(ARCH) --use_fast_math -Xptxas -O3 -I$(SRC_DIR) -I$(INC_DIR)
+NVCC_FLAGS = -O3 $(ARCH) --use_fast_math -Xptxas -O3 -I$(SRC_DIR) -I$(INC_DIR) -Xcompiler -MMD,-MP
 
 # --- Linker (链接器) ---
 # 最终链接通常交给 NVCC 处理，它会自动传递参数给 GCC
@@ -82,12 +82,13 @@ $(TARGET): $(OBJS)
 # --- 规则: 编译 C++ 文件 (.cpp -> .o) ---
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@echo "🔨 Compiling C++ $<"
-	@$(CXX) $(CXXFLAGS) $(CUDA_INC) -c $< -o $@
+	@$(CXX) $(CXXFLAGS)  -MT $@ -MMD -MP -MF $(patsubst %.o,%.d,$@) $(CUDA_INC) -c $< -o $@
 
 # --- 规则: 编译 CUDA 文件 (.cu -> .o) ---
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu
 	@echo "⚡ Compiling CUDA $<"
-	@$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+	@$(NVCC) $(NVCC_FLAGS)  -Xcompiler -MT,$@,-MMD,-MP,-MF,$(patsubst %.o,%.d,$@) -c $< -o $@
+	@sed -i 's| /tmp/[^ ]*||g' $(patsubst %.o,%.d,$@)
 
 # --- 引入自动生成的依赖文件 ---
 # 如果 .d 文件存在，Make 会读取它，从而知道哪些 .cpp 依赖哪些 .h
