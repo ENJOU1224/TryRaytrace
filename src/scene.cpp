@@ -128,14 +128,14 @@ Scene create_cornell_box() {
     // --- 外部模型 (Mesh) ---
     // 调用 loader 模块来加载 cube.obj 文件
     // 参数: 文件名, 目标容器, 位置偏移, 缩放大小, 颜色, 材质
-    load_obj("assets/cow.obj", scene.objects, 
-             {50, 25, 40}, 
-             8.0f, 
+    load_obj("assets/teapot.obj", scene.objects, 
+             {50, 10, 40}, 
+             10.0f, 
              {0.0f, 0.0f, 0.0f},
              {1.0f, 1.0f, 1.0f},  // 玻璃本身是白/透的
              0.0f, 0.0f,          // 非金属，光滑
              0.0f, 1.45f,         //  透射=1.0, 折射率=1.45
-             -1, false);       
+             -1, true);       
     // 打印场景信息
     printf("[Scene] Scene created with %lu objects.\n", scene.objects.size());
     return scene;

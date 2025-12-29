@@ -266,7 +266,7 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         
         // [漫反射抑制]: 金属度越高，漫反射权重呈指数级下降
         // 0.0 -> 1.0;  0.5 -> 0.125;  1.0 -> 0.0
-        float diffuse_scale = powf(1.0f - metallic, 2.0f);
+        float diffuse_scale = powf(1.0f - metallic, 3.0f);
 
         // [镜面反射抑制]: 粗糙度越高，镜面反射权重下降 (仅针对非金属!)
         // 原始衰减: 1.0 - r^2 (粗糙度1.0时衰减为0)
@@ -363,7 +363,7 @@ __global__ void render_kernel_impl(Vec* accum_buffer, int width, int height, int
         else {
             
             // --- NEE (直接光照采样) ---
-            if (light_count > 0 && roughness > 0.1f) {
+            if (light_count > 0 ) {
                 // 1. 随机选灯
                 int l_idx = (int)(curand_uniform(&state) * (light_count - 0.001f));
                 const Object& light = scene_objects[light_indices[l_idx]];
