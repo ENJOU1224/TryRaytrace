@@ -70,20 +70,29 @@ void save_snapshot(const Vec* h_accum, int w, int h, int frame, float focus_dist
     // ------------------------------------------------------------------
     // 4. 二进制写入 (Disk IO Bound)
     // ------------------------------------------------------------------
-    FILE* f = fopen(filename, "wb"); // wb = Write Binary
+    FILE* f = fopen(filename, "wb"); 
     if (f) {
-        // 写入 P6 文件头 (ASCII 文本)
-        // 格式: P6 <宽> <高> <最大颜色值> <换行>
         fprintf(f, "P6\n%d %d\n%d\n", w, h, 255);
-        
-        // 写入像素数据 (二进制块)
-        // fwrite 是缓冲 IO，但在写入大量数据时，它会直接调用系统调用，效率极高
         fwrite(img.data(), 1, w * h * 3, f);
-        
         fclose(f);
         
-        // 打印成功信息到终端
-        std::cout << "[IO] Snapshot saved: " << filename << std::endl;
+        // --- [新增] 自动保存 Log 文件 ---
+        char log_filename[256];
+        sprintf(log_filename, "logs/%s_Frame%d.log", time_str, frame);
+        FILE* lf = fopen(log_filename, "w");
+        if (lf) {
+            fprintf(lf, "Render Statistics:\n");
+            fprintf(lf, "------------------\n");
+            fprintf(lf, "Timestamp: %s\n", time_str);
+            fprintf(lf, "Total Frames: %d\n", frame);
+            fprintf(lf, "Resolution: %dx%d\n", w, h);
+            fprintf(lf, "Focus Distance: %.2f\n", focus_dist);
+            fprintf(lf, "Aperture Radius: %.2f\n", aperture);
+            fprintf(lf, "\nNotes: Rendered via SYCL on Intel Core Ultra 258V SoC.\n");
+            fclose(lf);
+        }
+
+        std::cout << "[IO] Snapshot and Log saved: " << filename << std::endl;
     } else {
         std::cerr << "[IO Error] Failed to open file for writing: " << filename << std::endl;
     }

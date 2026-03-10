@@ -27,31 +27,19 @@ enum Refl_t {
 // 16*6 (Vec) + 4*4 (Scalar) = 112 字节。
 // 没有哪怕 1 个字节的 Padding 浪费！带宽利用率 100%。
 // --------------------------------------------------------------------------------------
-struct Object {
-    // --- 16字节对齐的大块数据 (Vectors) ---
-    
-    // [三角形专用]
-    // 为了支持网格模型，我们需要存储三个顶点。
+struct ALIGN(16) Object {
     Vec v0, v1, v2; 
+    Vec albedo;   
+    Vec emission; 
 
-    // [材质属性]
-    Vec albedo;   // 原来的 color。非金属的漫反射颜色 / 金属的反射颜色
-    Vec emission; // 自发光强度 (Light Source)
+    float metallic;   
+    float roughness;  
+    float ior;        
+    float transmission; 
 
-    // --- 4字节的小块数据 (Scalars) ---
-    // 将它们凑在一起，刚好填满一个 16 字节的 Cache Line
-    
-    float metallic;   // [0.0 - 1.0] 0=塑料/木头, 1=金属
-    float roughness;  // [0.0 - 1.0] 0=光滑, 1=粗糙
-    float ior;        // 折射率 (Index of Refraction), 玻璃=1.45, 水=1.33
-    float transmission; // [0.0 - 1.0] 0=不透明, 1=玻璃
-
-    // 还需要存纹理ID，这得另起一行了
     int tex_id; 
     
-    // 填充 12 字节 (3个float) 保持 16 字节对齐
     float pad1, pad2, pad3;
-
 };
 
 // ======================================================================================

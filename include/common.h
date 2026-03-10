@@ -1,9 +1,24 @@
-#pragma once // [C++预处理指令] 防止头文件被重复包含 (Include Guard)
+#pragma once
 
-// 引入标准数学库 (sqrt, pow, fabs 等)
 #include <cmath>
-// 引入 CUDA 运行时库 (为了使用 __host__, __device__, __align__ 等关键字)
-#include <cuda_runtime.h>
+#include <algorithm>
+
+// 处理 CUDA 和 SYCL 的兼容性宏
+#if defined(__CUDACC__)
+    #include <cuda_runtime.h>
+    #define HOST_DEVICE __host__ __device__
+    #define ALIGN(n) __align__(n)
+#elif defined(__SYCL_DEVICE_ONLY__) || defined(SYCL_LANGUAGE_VERSION)
+    #include <sycl/sycl.hpp>
+    #define HOST_DEVICE
+    #define ALIGN(n) alignas(n)
+#else
+    #define HOST_DEVICE
+    #define ALIGN(n) alignas(n)
+    #ifndef __align__
+        #define __align__(n) alignas(n)
+    #endif
+#endif
 
 // [兼容性宏]
 // M_PI 是圆周率。虽然标准库通常有，但在某些编译器设置下可能未定义。
@@ -21,88 +36,54 @@
 //    这样 GPU 读取一个 Vec 只需要 1 个指令周期，而不是拆成多次。
 // 2. 正确性: 强制 CPU 和 GPU 使用相同的内存布局。
 //    防止因为编译器默认对齐策略不同，导致 CPU 传给 GPU 的数据错位 (比如我们之前遇到的镜面球变玻璃球的问题)。
-struct __align__(16) Vec {
+struct ALIGN(16) Vec {
     float x, y, z; 
-    // 实际上末尾还有隐藏的 float padding; 用于凑齐 16 字节
 
-    // ----------------------------------------------------------------------------------
-    // [CUDA 关键字]: __host__ __device__
-    // 这告诉编译器：请把下面这个函数编译两遍！
-    // 一份机器码给 CPU 用 (Host)，一份机器码给显卡用 (Device)。
-    // 这样我们就可以在两端共用同一套数学逻辑，无需写两遍代码。
-    // ----------------------------------------------------------------------------------
-
-    // [C++ 特性]: 运算符重载 (Operator Overloading)
-    // 允许我们像操作普通数字一样操作向量：Vec c = a + b;
-    // const Vec& b : 引用传递 (相当于 C 的 const pointer)，避免拷贝结构体，速度快。
-    // const : 函数后面的 const 表示这个函数是"只读"的，不会修改 x,y,z 的值。
-
-    // 向量加法: 位置叠加 或 颜色叠加
-    __host__ __device__ Vec operator+(const Vec& b) const { 
+    HOST_DEVICE Vec operator+(const Vec& b) const { 
         return {x + b.x, y + b.y, z + b.z}; 
     }
 
-    // 向量减法: 计算两个点之间的距离向量 (Destination - Origin)
-    __host__ __device__ Vec operator-(const Vec& b) const { 
+    HOST_DEVICE Vec operator-(const Vec& b) const { 
         return {x - b.x, y - b.y, z - b.z}; 
     }
 
-    // 向量数乘: 缩放向量长度 或 调节亮度
-    // 比如: 红色 {1,0,0} * 0.5 = 暗红 {0.5, 0, 0}
-    __host__ __device__ Vec operator*(float b) const { 
+    HOST_DEVICE Vec operator*(float b) const { 
         return {x * b, y * b, z * b}; 
     }
 
-    // [图形学核心]: 逐分量相乘 (Component-wise Multiplication)
-    // 这不是数学上的点积或叉积，而是颜色的"过滤"。
-    // 场景: 白光 {1,1,1} 照在 红墙 {1,0,0} 上。
-    // 结果: {1*1, 1*0, 1*0} = {1,0,0} (红光)。墙壁吸收了绿和蓝。
-    // 变量名 mult 是为了和 operator* 区分。
-    __host__ __device__ Vec mult(const Vec& b) const { 
+    HOST_DEVICE Vec mult(const Vec& b) const { 
         return {x * b.x, y * b.y, z * b.z}; 
     }
 
-    // [图形学核心]: 归一化 (Normalize)
-    // 作用: 保持方向不变，将长度缩放为 1.0。
-    // 在光线追踪中，表示"方向"的向量(如光线方向、法线)必须是单位向量，否则计算角度会出错。
-    // 注意: 这个函数没有 const，因为它会修改"自己" (this->x, ...)。
-    __host__ __device__ Vec& norm() { 
-        float len = sqrtf(x * x + y * y + z * z);
+    HOST_DEVICE Vec& norm() { 
+#if defined(__SYCL_DEVICE_ONLY__)
+        float len = sycl::native::sqrt(x * x + y * y + z * z);
+#else
+        float len = std::sqrt(x * x + y * y + z * z);
+#endif
         if (len > 0) { 
-            float invLen = 1.0f / len; // 乘法比除法快，先算倒数
+            float invLen = 1.0f / len;
             x *= invLen; y *= invLen; z *= invLen; 
         }
-        return *this; // 返回自己的引用，支持链式调用
+        return *this;
     }
 
-    // [图形学核心]: 点积 (Dot Product)
-    // 公式: A · B = |A|*|B|*cos(θ)
-    // 几何意义: 衡量两个向量方向的"相似度"。
-    // 1.0: 方向完全相同
-    // 0.0: 垂直 (光线擦肩而过，没有照亮表面)
-    // -1.0: 方向相反 (光线正面对撞)
-    __host__ __device__ float dot(const Vec& b) const { 
+    HOST_DEVICE float dot(const Vec& b) const { 
+#if defined(__SYCL_DEVICE_ONLY__)
+        return sycl::fma(x, b.x, sycl::fma(y, b.y, z * b.z));
+#else
         return x * b.x + y * b.y + z * b.z; 
+#endif
     }
 
-    // [图形学核心]: 叉积 (Cross Product)
-    // 几何意义: 给定两个向量，求出垂直于它们平面的第三个向量。
-    // 用途: 构建三维坐标系 (构建相机的 X, Y, Z 轴)。
-    __host__ __device__ Vec cross(const Vec& b) const { 
+    HOST_DEVICE Vec cross(const Vec& b) const { 
         return {y * b.z - z * b.y, z * b.x - x * b.z, x * b.y - y * b.x}; 
     }
 
-    __host__ __device__ float norm_len() const { return sqrtf(x*x + y*y + z*z); }
-
+    HOST_DEVICE float norm_len() const { return std::sqrt(x*x + y*y + z*z); }
 };
 
-// ======================================================================================
-// 辅助工具函数
-// ======================================================================================
-
-// [辅助函数] 快速创建向量 (C 风格)
-// inline: 建议编译器将函数体直接嵌入调用处，减少函数调用开销。
-__host__ __device__ inline Vec make_vec(float x, float y, float z) { 
+HOST_DEVICE inline Vec make_vec(float x, float y, float z) { 
     Vec v = {x, y, z}; 
     return v; 
 }

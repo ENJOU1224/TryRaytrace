@@ -98,7 +98,7 @@ Scene create_cornell_box() {
              10.0f,                 // 缩放: 模型原始大小是 -1到1，放大10倍
              white,    // 颜色: 金色
              1.0f,                  // 材质: 镜面
-             0.1f);                 
+             1.0f);                 
 
     // 打印场景信息
     printf("[Scene] Scene created with %lu objects.\n", scene.objects.size());

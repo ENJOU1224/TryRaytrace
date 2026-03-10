@@ -9,22 +9,21 @@
 // ======================================================================================
 // 为了 GPU 读取效率，我们需要紧凑的数据结构。
 // 这里的节点既可以是"内部节点"(包含左右子树)，也可以是"叶子节点"(包含物体)。
-struct __align__(16) LinearBVHNode {
-    AABB bounds; // 包围盒 (32 bytes: 16 min + 16 max)
+struct ALIGN(16) LinearBVHNode {
+    AABB bounds; 
 
-    // 联合体
     union {
-        int left_child_idx; // 内部节点用: 左孩子索引
-        int primitive_offset; // 叶子节点用: 物体在数组中的偏移
+        int left_child_idx; 
+        int primitive_offset; 
     };
 
     union {
-        int right_child_idx; // 内部节点用: 右孩子索引
-        int primitive_count; // 叶子节点用: 物体数量
+        int right_child_idx; 
+        int primitive_count; 
     };
     
-    int axis;    // 调试用
-    int is_leaf; // 1=Leaf, 0=Internal (单独一个标记位最清晰)
+    int axis;    
+    int is_leaf; 
 };
 
 // ======================================================================================
