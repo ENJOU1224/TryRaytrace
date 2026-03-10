@@ -1,57 +1,45 @@
-#pragma once // 防止头文件重复包含
-
-// 引入场景定义，我们需要 Object 和 CameraParams 结构体
+#pragma once
+#include "common.h"
 #include "scene.h"
 #include "bvh.h"
+#include <vector>
+#include <string>
 
-// ======================================================================================
-// 渲染器接口 (Renderer Interface)
-// ======================================================================================
-// [架构说明]
-// 这里的函数充当了 CPU (Host) 代码调用 GPU (Device) 代码的"桥梁"。
-// 
-// 1. 为什么不能直接在 main.cpp 里写 CUDA 代码？
-//    - main.cpp 是用标准 C++ 编译器 (g++) 编译的，它不懂 <<<...>>> 这种 CUDA 语法。
-//    - renderer.cu 是用 NVIDIA 编译器 (nvcc) 编译的。
-//    - renderer.h 是两者都能看到的"协议"，声明了普通 C++ 函数供 main 调用。
-// ======================================================================================
+/**
+ * @file renderer.h
+ * @brief SYCL 渲染后端接口定义
+ * 
+ * 职责:
+ * 1. 管理 GPU 资源 (USM 内存分配与释放)。
+ * 2. 处理场景数据的上传与转换。
+ * 3. 发射渲染内核并处理同步。
+ */
 
-// --------------------------------------------------------------------------------------
-// [接口 1] 初始化场景数据
-// --------------------------------------------------------------------------------------
-// 作用: 将 CPU 端的场景数据（物体列表、纹理路径）搬运到 GPU 显存中。
-//
-// 性能提示:
-// - 这个函数涉及 PCIe 总线传输 (Host -> Device)，速度相对较慢。
-// - 但它只在程序启动时调用一次，所以不是性能瓶颈。
-//
-// 参数:
-//   objects:       包含所有物体数据的 vector (将拷贝到 GPU 常量内存)
-//   texture_files: 纹理文件路径列表 (用于加载图片并上传到 GPU Texture Memory)
-//   nodes:         线性bvh树
-//   light_indices: 光源索引
-// --------------------------------------------------------------------------------------
-// 增加 int light_count 参数
+// 渲染器初始化逻辑
+void init_renderer_sycl();
+
+/**
+ * @brief 初始化并上传场景数据
+ * 
+ * @param objects 场景中的几何物体列表
+ * @param texture_files 纹理路径列表 (目前由 init_scene_data 内部管理加载逻辑)
+ * @param nodes 预构建好的线性 BVH 节点数组
+ * @param light_indices 光源索引列表 (用于 NEE 采样)
+ */
 void init_scene_data(const std::vector<Object>& objects, 
                      const std::vector<std::string>& texture_files,
                      const std::vector<LinearBVHNode>& nodes,
-                     const std::vector<int>& light_indices); // [新增]
+                     const std::vector<int>& light_indices);
 
-// --------------------------------------------------------------------------------------
-// [接口 2] 启动渲染内核 (Kernel Launcher)
-// --------------------------------------------------------------------------------------
-// 作用: 计算线程块 (Block) 和网格 (Grid) 的维度，向 GPU 发射计算指令。
-//
-// 异步特性:
-// - 这个函数是非阻塞的。CPU 发出指令后会立刻返回，不会等待 GPU 算完。
-// - 真正的同步等待发生在 main.cpp 里的 cudaDeviceSynchronize()。
-//
-// 参数:
-//   accum_buffer: 指向 GPU 显存的指针 (Device Pointer)。
-//                 注意：这是 GPU 里的地址，CPU 不能直接读写它，只能传指针。
-//   width, height: 图像分辨率。
-//   frame_seed:    随机数种子偏移量。每一帧递增，让蒙特卡洛噪点分布变化。
-//   tx, ty:        线程块大小 (通常 16x16)。调整它可能会微调 GPU 占用率。
-//   cam:           当前帧的相机参数 (位置、光圈、焦距等)。
-// --------------------------------------------------------------------------------------
-void launch_render_kernel(Vec* accum_buffer, int width, int height, int frame_seed, int tx, int ty, CameraParams cam);
+/**
+ * @brief 启动路径追踪内核
+ * 
+ * @param accum_buffer_usm 累加缓冲区 (必须是 USM Shared 类型)
+ * @param width 画面宽度
+ * @param height 画面高度
+ * @param frame_seed 随机数种子 (通常使用当前帧序号)
+ * @param tx 工作组宽度 (建议针对 Intel GPU 设为 16)
+ * @param ty 工作组高度 (建议针对 Intel GPU 设为 8)
+ * @param cam 相机参数 (位置、视角等)
+ */
+void launch_render_kernel(Vec* accum_buffer_usm, int width, int height, int frame_seed, int tx, int ty, CameraParams cam);
