@@ -13,6 +13,7 @@
 #include "input.h"      
 #include "image_io.h"   
 #include "bvh.h"        
+#include "denoiser.h"
 
 /**
  * @file main.cpp
@@ -27,7 +28,48 @@
 std::atomic<bool> quit(false);
 void signal_handler(int signal) { if (signal == SIGINT) quit = true; }
 
+namespace {
+
+/**
+ * 将路径追踪累积缓冲区转换为“线性 RGB 帧”。
+ *
+ * 注意这里故意不做 Gamma 校正:
+ * 1. 大多数图像降噪模型更适合吃线性空间数据；
+ * 2. Gamma 校正属于显示阶段，不应混入推理输入。
+ */
+void build_linear_rgb_frame(const Vec* accum, int pixel_count, int frame_index, std::vector<float>& rgb_buffer) {
+    #pragma omp parallel for
+    for (int i = 0; i < pixel_count; ++i) {
+        Vec color = accum[i] * (1.0f / frame_index);
+        rgb_buffer[i * 3 + 0] = std::max(0.0f, color.x);
+        rgb_buffer[i * 3 + 1] = std::max(0.0f, color.y);
+        rgb_buffer[i * 3 + 2] = std::max(0.0f, color.z);
+    }
+}
+
+/**
+ * 将线性 RGB 图像转换成 SDL 纹理可直接显示的 ARGB8888。
+ * 这里才执行 Gamma 校正，保证“推理输入”和“显示输出”职责分离。
+ */
+void linear_rgb_to_argb8888(const float* rgb_buffer, int pixel_count, uint32_t* pixel_buffer) {
+    #pragma omp parallel for
+    for (int i = 0; i < pixel_count; ++i) {
+        const float r = std::pow(clamp(rgb_buffer[i * 3 + 0]), 1.0f / 2.2f);
+        const float g = std::pow(clamp(rgb_buffer[i * 3 + 1]), 1.0f / 2.2f);
+        const float b = std::pow(clamp(rgb_buffer[i * 3 + 2]), 1.0f / 2.2f);
+        pixel_buffer[i] = (255 << 24) |
+                          (static_cast<uint32_t>(r * 255.0f + 0.5f) << 16) |
+                          (static_cast<uint32_t>(g * 255.0f + 0.5f) << 8) |
+                          static_cast<uint32_t>(b * 255.0f + 0.5f);
+    }
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+
     // 注册信号处理，支持 Ctrl+C 安全退出
     std::signal(SIGINT, signal_handler);
 
@@ -86,6 +128,14 @@ int main(int argc, char** argv) {
     
     // CPU 侧像素映射缓冲区 (用于 SDL 显示)
     uint32_t* pixel_buffer = (uint32_t*)malloc(w * h * sizeof(uint32_t));
+    std::vector<float> linear_rgb_frame(w * h * 3, 0.0f);
+
+    FrameDenoiser denoiser;
+    denoiser.initialize_from_env(w, h);
+    std::string last_denoiser_status = denoiser.status();
+    if (!last_denoiser_status.empty()) {
+        std::cout << last_denoiser_status << std::endl;
+    }
 
     InputManager input; 
     int gpu_frame = 1;
@@ -111,6 +161,7 @@ int main(int argc, char** argv) {
         if (state.camera_moved) {
             gpu_frame = 1;
             std::memset(d_accum, 0, w * h * sizeof(Vec));
+            denoiser.reset();
         }
 
         // [B] 发射渲染内核
@@ -118,13 +169,19 @@ int main(int argc, char** argv) {
         // 建议 tx=16, ty=8 以匹配 Intel Xe2 硬件 Sub-group 布局
         launch_render_kernel(d_accum, w, h, gpu_frame, 16, 8, cam_params);
         
-        // [C] 图像后处理 (Tone Mapping & Gamma Correction)
-        // 利用 OpenMP 并行化处理 100万+ 个像素的指数运算
-        #pragma omp parallel for
-        for (int i = 0; i < w * h; i++) {
-            Vec color = d_accum[i] * (1.0f / gpu_frame);
-            pixel_buffer[i] = (255 << 24) | (toInt(color.x) << 16) | (toInt(color.y) << 8) | toInt(color.z);
+        // [C] 图像后处理与 NPU 降噪
+        build_linear_rgb_frame(d_accum, w * h, gpu_frame, linear_rgb_frame);
+
+        if (denoiser.should_run(gpu_frame) && !denoiser.run(linear_rgb_frame.data(), w, h)) {
+            if (denoiser.status() != last_denoiser_status) {
+                std::cout << denoiser.status() << std::endl;
+                last_denoiser_status = denoiser.status();
+            }
         }
+
+        const float* active_rgb = denoiser.has_output() ? denoiser.output_rgb().data()
+                                                        : linear_rgb_frame.data();
+        linear_rgb_to_argb8888(active_rgb, w * h, pixel_buffer);
 
         // [D] 更新 SDL 屏幕
         SDL_UpdateTexture(texture, NULL, pixel_buffer, w * sizeof(uint32_t));
@@ -140,9 +197,10 @@ int main(int argc, char** argv) {
 
         if (gpu_frame % 5 == 0) {
             char title[256];
-            sprintf(title, "[%s] FPS: %.1f | Frame: %d | F: %.1f | A: %.2f", 
+            sprintf(title, "[%s] FPS: %.1f | Frame: %d | F: %.1f | A: %.2f | Denoise: %s", 
                     q.get_device().get_info<sycl::info::device::name>().c_str(),
-                    fps, gpu_frame, cam.get_focus_dist(), cam.get_aperture());
+                    fps, gpu_frame, cam.get_focus_dist(), cam.get_aperture(),
+                    denoiser.is_enabled() ? denoiser.device_name().c_str() : "OFF");
             SDL_SetWindowTitle(window, title);
 
             // 命令行进度刷新

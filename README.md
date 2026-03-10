@@ -17,6 +17,10 @@
   - **Firefly Clamping**: 严格的数值钳制，防止出现高亮异常噪点。
   - **鲁棒性防火墙**: 内置 NaN/Inf 过滤与负值清理。
   - **实时反馈**: 实时 FPS 统计、终端渲染进度刷新及自动 Snapshot/Log 保存。
+- **NPU 帧降噪接口**:
+  - 基于 OpenVINO C++ Runtime，可将单输入单输出 RGB 图像模型部署到 `NPU`。
+  - 当前实现支持 `NCHW/NHWC` 两类 4D 图像张量，并在显示前对输出做布局转换与缩放。
+  - 未配置模型时，渲染器会自动回退到原始画面，不影响主渲染流程。
 
 ## 🛠️ 环境需求
 
@@ -26,12 +30,14 @@
   - `intel-level-zero-gpu` (推荐)
   - `intel-opencl-icd`
 - **工具链**: [Intel oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit.html) (需包含 `icpx` 编译器)
+- **OpenVINO**: 需提供 C++ Runtime 与 NPU 插件
 
 ## 🔨 构建与运行
 
-1. **激活 oneAPI 环境**:
+1. **激活 oneAPI 与 OpenVINO 环境**:
    ```bash
-   source /opt/intel/oneapi/setvars.sh
+   source ~/intel/oneapi/setvars.sh
+   source ~/intel/openvino_2026/setupvars.sh
    ```
 
 2. **编译项目**:
@@ -41,8 +47,38 @@
 
 3. **运行渲染器**:
    ```bash
-   ./bin/sycl_engine
+    ./bin/sycl_engine
    ```
+
+4. **检查 OpenVINO 是否识别到 NPU**:
+   ```bash
+   make checknpu
+   ```
+
+## 🧠 NPU 降噪使用方式
+
+渲染器不会自带降噪模型。要启用 NPU 帧降噪，请在运行前设置模型路径：
+
+```bash
+export TRYRAYTRACE_DENOISE_MODEL=/path/to/your_denoise_model.xml
+export TRYRAYTRACE_DENOISE_DEVICE=NPU
+export TRYRAYTRACE_DENOISE_INTERVAL=1
+./bin/sycl_engine
+```
+
+可选环境变量：
+
+- `TRYRAYTRACE_DENOISE_MODEL`: OpenVINO IR/ONNX 模型路径，未设置时自动关闭降噪。
+- `TRYRAYTRACE_DENOISE_DEVICE`: 推理设备，默认 `NPU`。
+- `TRYRAYTRACE_DENOISE_INTERVAL`: 每隔多少帧执行一次降噪，默认 `1`。
+- `TRYRAYTRACE_DENOISE_INPUT_LAYOUT`: 手动指定模型输入布局，支持 `NCHW` / `NHWC`。
+- `TRYRAYTRACE_DENOISE_OUTPUT_LAYOUT`: 手动指定模型输出布局，支持 `NCHW` / `NHWC`。
+
+模型约束：
+
+- 仅支持单输入单输出模型。
+- 输入输出都应表示 3 通道 RGB 图像。
+- 如果模型输出分辨率与窗口分辨率不同，程序会在显示前缩放回当前窗口大小。
 
 ## 🎮 操作快捷键
 
