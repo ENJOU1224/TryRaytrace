@@ -24,6 +24,7 @@ LDFLAGS = -lSDL2 -fsycl -qopenmp
 
 # 3. 目标文件
 TARGET = $(OBJ_DIR)/sycl_engine
+CHECK_NPU_TARGET = $(OBJ_DIR)/check_npu
 
 # 源文件列表 (移除 renderer.cu 和 pipeline.cpp，因为我们简化了逻辑)
 OBJS_NAMES = bvh.o renderer_sycl.o camera.o scene.o loader.o input.o image_io.o main.o
@@ -48,8 +49,33 @@ run: all
 	@echo "🚀 Running SYCL Raytracer..."
 	@./$(TARGET)
 
+check-env:
+	@if [ -z "$$ONEAPI_ROOT" ] || ! command -v $(CXX) >/dev/null 2>&1; then \
+		echo "错误：Intel oneAPI 环境未就绪。"; \
+		echo "请先执行：source $$HOME/intel/oneapi/setvars.sh"; \
+		exit 1; \
+	fi
+	@if [ -z "$$OpenVINO_DIR" ]; then \
+		echo "错误：OpenVINO 环境未就绪。"; \
+		echo "请先执行：source $$HOME/intel/openvino_2026/setupvars.sh"; \
+		exit 1; \
+	fi
+
+$(CHECK_NPU_TARGET): $(SRC_DIR)/check_npu.cpp | dir
+	@echo "🔨 编译 $<"
+	@OV_ROOT=$$(cd "$$OpenVINO_DIR/../.." && pwd); \
+	$(CXX) -std=c++17 -Wall -Wextra $< -o $@ \
+	-I$$OV_ROOT/runtime/include \
+	-L$$OV_ROOT/runtime/lib/intel64 \
+	-Wl,-rpath,$$OV_ROOT/runtime/lib/intel64 \
+	-lopenvino
+
+checknpu: check-env $(CHECK_NPU_TARGET)
+	@echo "🧪 检查 OpenVINO 设备..."
+	@./$(CHECK_NPU_TARGET)
+
 clean:
 	@echo "🧹 Cleaning up..."
 	@rm -rf $(OBJ_DIR)
 
-.PHONY: all dir clean run
+.PHONY: all dir clean run check-env checknpu
