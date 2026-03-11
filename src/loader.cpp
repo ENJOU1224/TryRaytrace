@@ -49,6 +49,8 @@ void load_obj(const char* filename, std::vector<Object>& objects,
             
             // [坐标变换]: 模型空间 -> 世界空间
             // 公式: v_world = v_model * scale + offset
+            // 这样后续 GPU kernel 拿到的就是最终世界空间坐标，
+            // 不需要再做矩阵乘法。
             v = v * scale + offset;
             
             temp_vertices.push_back(v);
@@ -80,7 +82,7 @@ void load_obj(const char* filename, std::vector<Object>& objects,
 
 
                 // [构建三角形对象]
-                // 使用 C++20 指定初始化器，清晰明了
+                // 这里统一走 make_object()，让几何预计算在 CPU 端完成。
                 objects.push_back(make_object(v0,
                                               v1,
                                               v2,

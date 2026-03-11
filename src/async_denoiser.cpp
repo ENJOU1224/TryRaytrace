@@ -25,6 +25,10 @@ AsyncFrameDenoiser::~AsyncFrameDenoiser() {
 }
 
 void AsyncFrameDenoiser::initialize(int frame_width, int frame_height) {
+    // 重新初始化前，先把旧线程完整停掉。
+    // 这样可以避免：
+    // - 旧线程仍在读写旧缓冲
+    // - 重新初始化后出现双线程同时访问同一对象
     stop_worker();
 
     width_ = frame_width;
@@ -37,16 +41,20 @@ void AsyncFrameDenoiser::initialize(int frame_width, int frame_height) {
     stop_requested_.store(false);
     enabled_.store(false);
 
+    // 分配一块待处理缓冲和两块结果缓冲。
+    // 结果缓冲做成双缓冲，是为了让“后台线程写结果”和“前台线程读结果”更少冲突。
     pending_frame_.assign(static_cast<size_t>(width_) * height_ * 3, 0.0f);
     result_buffers_[0].assign(static_cast<size_t>(width_) * height_ * 3, 0.0f);
     result_buffers_[1].assign(static_cast<size_t>(width_) * height_ * 3, 0.0f);
 
+    // 这里仍然复用同步版 FrameDenoiser，只是把它包进独立线程里。
     denoiser_.initialize(width_, height_);
     status_ = denoiser_.status();
     if (!denoiser_.is_enabled()) {
         return;
     }
 
+    // 只有底层同步降噪器初始化成功，才真正起后台线程。
     enabled_.store(true);
     worker_ = std::thread(&AsyncFrameDenoiser::worker_loop, this);
 }
@@ -68,6 +76,10 @@ void AsyncFrameDenoiser::submit_frame(int frame_id, const float* input_rgb_nhwc)
         return;
     }
 
+    // 主线程这里采用“覆盖最新待处理帧”的策略，而不是排长队。
+    // 好处：
+    // 1. 不会因为 NPU 速度暂时跟不上而无限堆积内存。
+    // 2. 显示端总是尽快追上最近的画面。
     const size_t byte_size = static_cast<size_t>(width_) * height_ * 3 * sizeof(float);
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
@@ -96,6 +108,8 @@ const std::vector<float>& AsyncFrameDenoiser::latest_result() const {
 }
 
 void AsyncFrameDenoiser::worker_loop() {
+    // local_input 是工作线程自己的本地缓冲。
+    // 这样后台线程处理时，不会直接踩主线程正在写的 pending_frame。
     std::vector<float> local_input(static_cast<size_t>(width_) * height_ * 3, 0.0f);
 
     while (!stop_requested_.load()) {
@@ -118,12 +132,17 @@ void AsyncFrameDenoiser::worker_loop() {
             pending_ready_ = false;
         }
 
+        // 这里是真正的同步 NPU 推理点，但它发生在后台线程里，
+        // 所以不会阻塞主渲染循环。
         if (!denoiser_.run(local_input.data(), width_, height_)) {
             status_ = denoiser_.status();
             enabled_.store(false);
             break;
         }
 
+        // 结果缓冲双缓冲写入：
+        // - 一个缓冲当前可能正在被主线程显示
+        // - 后台线程写另一个缓冲
         int current_ready = ready_buffer_index_.load();
         int write_index = (current_ready == 0) ? 1 : 0;
         std::memcpy(result_buffers_[write_index].data(),
@@ -135,6 +154,7 @@ void AsyncFrameDenoiser::worker_loop() {
 }
 
 void AsyncFrameDenoiser::stop_worker() {
+    // 析构或重新初始化时都要走这里，确保线程不会悬挂。
     stop_requested_.store(true);
     pending_cv_.notify_all();
     if (worker_.joinable()) {
