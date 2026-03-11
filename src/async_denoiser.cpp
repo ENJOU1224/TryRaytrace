@@ -3,6 +3,21 @@
 #include <cstring>
 #include <utility>
 
+/**
+ * 这个文件只做一件事：
+ * 把同步的 FrameDenoiser 包装成一个简单的后台线程流水线。
+ *
+ * 主线程职责：
+ * - 继续正常渲染
+ * - 提交最新线性帧
+ * - 显示最近完成的一帧降噪结果
+ *
+ * 后台线程职责：
+ * - 等待最新待处理帧
+ * - 调用同步 OpenVINO 推理
+ * - 发布最新结果
+ */
+
 AsyncFrameDenoiser::AsyncFrameDenoiser() = default;
 
 AsyncFrameDenoiser::~AsyncFrameDenoiser() {

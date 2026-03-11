@@ -31,9 +31,9 @@ CHECK_NPU_TARGET = $(OBJ_DIR)/check_npu
 DEMO_TARGET = $(OBJ_DIR)/denoise_demo
 
 # 源文件列表 (移除 renderer.cu 和 pipeline.cpp，因为我们简化了逻辑)
-OBJS_NAMES = bvh.o renderer_sycl.o camera.o scene.o loader.o input.o image_io.o denoiser_openvino.o async_denoiser.o main.o
+OBJS_NAMES = bvh.o renderer_sycl.o camera.o scene.o loader.o input.o image_io.o frame_processing.o perf_monitor.o denoiser_openvino.o async_denoiser.o main.o
 OBJS = $(addprefix $(OBJ_DIR)/, $(OBJS_NAMES))
-DEMO_OBJS_NAMES = bvh.o renderer_sycl.o camera.o scene.o loader.o denoiser_openvino.o denoise_demo.o
+DEMO_OBJS_NAMES = bvh.o renderer_sycl.o camera.o scene.o loader.o frame_processing.o denoiser_openvino.o denoise_demo.o
 DEMO_OBJS = $(addprefix $(OBJ_DIR)/, $(DEMO_OBJS_NAMES))
 
 # 4. 构建规则

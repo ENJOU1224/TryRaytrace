@@ -144,8 +144,13 @@
 ## 📂 项目结构
 
 - `include/`: 核心数学库与 AABB/BVH 定义
+- `src/main.cpp`: 主调度器，负责输入、渲染、显示、异步降噪协同
 - `src/renderer_sycl.cpp`: SYCL 渲染核心 (GPU Kernels)
-- `src/main.cpp`: 系统调度与 SDL2 显示逻辑
+- `src/async_denoiser.cpp`: 异步 NPU 降噪流水线
+- `src/denoiser_openvino.cpp`: 内置 OpenVINO/NPU 降噪图
+- `src/perf_monitor.cpp`: 性能日志与 GPU/NPU 代理指标采样
+- `src/frame_processing.cpp`: 线性 RGB / 显示图像转换辅助函数
+- `src/bvh.cpp`: BVH 构建，当前使用分桶 SAH 划分
 - `assets/`: 支持加载 `.obj` 3D 模型
 
 ---
