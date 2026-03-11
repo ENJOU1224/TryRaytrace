@@ -18,7 +18,7 @@
 #include "input.h"      
 #include "image_io.h"   
 #include "bvh.h"        
-#include "denoiser.h"
+#include "async_denoiser.h"
 
 /**
  * @file main.cpp
@@ -36,9 +36,9 @@ void signal_handler(int signal) { if (signal == SIGINT) quit = true; }
 namespace {
 
 // 默认运行策略：
-// 1. 基础性能优先，默认关闭 NPU 降噪。
+// 1. 默认启用异步 NPU 降噪流水线。
 // 2. 诊断统计默认关闭，避免终端刷屏，也避免内核里频繁原子操作带来的额外开销。
-constexpr bool kEnableNpuDenoiser = false;
+constexpr bool kEnableNpuDenoiser = true;
 constexpr bool kEnableDiagnosticStats = false;
 constexpr int kProgressPrintInterval = 5;
 constexpr int kStaticPresentInterval = 2;
@@ -345,24 +345,6 @@ void accum_to_argb8888(const Vec* accum, int pixel_count, int frame_index, uint3
     }
 }
 
-/**
- * 将原图与降噪结果做渐进混合。
- *
- * 设计原因:
- * 1. 低采样帧数时，降噪结果不一定稳定，直接全量替换很容易“首帧劣化”。
- * 2. 通过 alpha 逐步抬高，可以让用户先看到可信的原图，再慢慢引入 NPU 平滑结果。
- */
-void blend_linear_rgb(const float* original_rgb,
-                      const float* denoised_rgb,
-                      float alpha,
-                      int pixel_count,
-                      std::vector<float>& blended_rgb) {
-    #pragma omp parallel for
-    for (int i = 0; i < pixel_count * 3; ++i) {
-        blended_rgb[i] = original_rgb[i] * (1.0f - alpha) + denoised_rgb[i] * alpha;
-    }
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -444,13 +426,11 @@ int main(int argc, char** argv) {
     // CPU 侧像素映射缓冲区 (用于 SDL 显示)
     std::vector<uint32_t> pixel_buffer(render_w * render_h, 0);
     std::vector<float> linear_rgb_frame;
-    std::vector<float> blended_rgb_frame;
     if (kEnableNpuDenoiser) {
         linear_rgb_frame.resize(static_cast<size_t>(render_w) * render_h * 3, 0.0f);
-        blended_rgb_frame.resize(static_cast<size_t>(render_w) * render_h * 3, 0.0f);
     }
 
-    FrameDenoiser denoiser;
+    AsyncFrameDenoiser denoiser;
     std::string last_denoiser_status;
     auto denoiser_begin = Clock::now();
     if (kEnableNpuDenoiser) {
@@ -496,9 +476,6 @@ int main(int argc, char** argv) {
         if (state.camera_moved) {
             gpu_frame = 1;
             std::memset(d_accum, 0, static_cast<size_t>(render_w) * render_h * sizeof(Vec));
-            if (kEnableNpuDenoiser) {
-                denoiser.reset();
-            }
         }
 
         // [B] 发射渲染内核
@@ -526,29 +503,18 @@ int main(int argc, char** argv) {
             if (kEnableNpuDenoiser) {
                 build_linear_rgb_frame(d_accum, render_w * render_h, gpu_frame, linear_rgb_frame);
 
-                if (denoiser.should_run(gpu_frame)) {
-                    auto denoise_begin_frame = Clock::now();
-                    bool denoise_ok = denoiser.run(linear_rgb_frame.data(), render_w, render_h);
-                    denoise_ms = elapsed_ms(denoise_begin_frame, Clock::now());
-                    if (!denoise_ok) {
-                        if (denoiser.status() != last_denoiser_status) {
-                            std::cout << denoiser.status() << std::endl;
-                            last_denoiser_status = denoiser.status();
-                        }
-                    }
+                auto denoise_begin_frame = Clock::now();
+                denoiser.submit_frame(gpu_frame, linear_rgb_frame.data());
+                denoise_ms = elapsed_ms(denoise_begin_frame, Clock::now());
+
+                if (denoiser.status() != last_denoiser_status) {
+                    std::cout << denoiser.status() << std::endl;
+                    last_denoiser_status = denoiser.status();
                 }
 
                 const float* active_rgb = linear_rgb_frame.data();
-                if (denoiser.has_output()) {
-                    const float alpha = denoiser.blend_alpha(gpu_frame);
-                    if (alpha > 0.0f) {
-                        blend_linear_rgb(linear_rgb_frame.data(),
-                                         denoiser.output_rgb().data(),
-                                         alpha,
-                                         render_w * render_h,
-                                         blended_rgb_frame);
-                        active_rgb = blended_rgb_frame.data();
-                    }
+                if (denoiser.has_result()) {
+                    active_rgb = denoiser.latest_result().data();
                 }
                 linear_rgb_to_argb8888(active_rgb, render_w * render_h, pixel_buffer.data());
             } else {
@@ -593,10 +559,11 @@ int main(int argc, char** argv) {
 
         if (gpu_frame % kProgressPrintInterval == 0) {
             char title[256];
-            sprintf(title, "[%s] FPS: %.1f | Frame: %d | Denoise: %s",
+            sprintf(title, "[%s] FPS: %.1f | Frame: %d | Denoise: %s | Lag: %d",
                     q.get_device().get_info<sycl::info::device::name>().c_str(),
                     fps, gpu_frame,
-                    (kEnableNpuDenoiser && denoiser.is_enabled()) ? denoiser.device_name().c_str() : "OFF");
+                    (kEnableNpuDenoiser && denoiser.is_enabled()) ? denoiser.device_name().c_str() : "OFF",
+                    (kEnableNpuDenoiser && denoiser.has_result()) ? (gpu_frame - denoiser.latest_result_frame_id()) : 0);
             SDL_SetWindowTitle(window, title);
 
             if (kEnableDiagnosticStats && render_stats) {
@@ -623,7 +590,11 @@ int main(int argc, char** argv) {
                        milli_to_float(render_stats->max_final_color_lum_milli));
                 fflush(stdout);
             } else {
-                printf("\r>> [SYCL] Frame %d | FPS: %.1f | Present: %s", gpu_frame, fps, frame_presented ? "yes" : "skip");
+                printf("\r>> [SYCL] Frame %d | FPS: %.1f | Present: %s | DenoiseLag: %d",
+                       gpu_frame,
+                       fps,
+                       frame_presented ? "yes" : "skip",
+                       (kEnableNpuDenoiser && denoiser.has_result()) ? (gpu_frame - denoiser.latest_result_frame_id()) : 0);
                 fflush(stdout);
             }
         }
