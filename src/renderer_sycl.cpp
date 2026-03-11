@@ -196,7 +196,11 @@ HOST_DEVICE Vec trace(Vec r_o, Vec r_d, Random& rng, const LinearBVHNode* bvh_no
                                 float su = sf * ss.dot(sh); if (su < 0.0f || su > 1.0f) continue;
                                 Vec sq = ss.cross(se1); float sv = sf * ld.dot(sq);
                                 if (sv < 0.0f || su + sv > 1.0f) continue;
-                                if (sf * se2.dot(sq) > 0.001f) { blocked = true; break; }
+                                // 阴影测试只应统计“光源之前”的遮挡物。
+                                // 如果不加上界判断，被采样到的灯三角形本身也可能被误判为遮挡，
+                                // 直接光会大面积失效，路径追踪只能依赖随机命中光源，方差会急剧上升。
+                                float st = sf * se2.dot(sq);
+                                if (st > 0.001f && st < dist - 0.01f) { blocked = true; break; }
                             }
                             if(blocked) break;
                         } else { s_stack[s_ptr++] = bvh_nodes[idx].right_child_idx; s_stack[s_ptr++] = bvh_nodes[idx].left_child_idx; }
