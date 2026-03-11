@@ -10,12 +10,13 @@
  *
  * 设计目标:
  * 1. 将 OpenVINO / NPU 相关细节封装到独立模块，避免主循环被推理代码淹没。
- * 2. 允许项目在“未配置模型”或“NPU 初始化失败”时自动回退到原始渲染画面。
- * 3. 通过清晰的接口边界，让后续更换模型、切换设备或加入异步推理更容易。
+ * 2. 允许项目在“未检测到 NPU”或“NPU 初始化失败”时自动回退到原始渲染画面。
+ * 3. 当前内置一个固定权重的轻量卷积降噪模型，方便学习 OpenVINO 推理链路。
+ * 4. 通过清晰的接口边界，让后续替换成训练好的模型或加入异步推理更容易。
  */
 class FrameDenoiser {
 public:
-    /// 构造函数不会立刻加载模型，真正的初始化发生在 initialize_from_env()。
+    /// 构造函数不会立刻加载模型，真正的初始化发生在 initialize()。
     FrameDenoiser();
     ~FrameDenoiser();
 
@@ -25,17 +26,8 @@ public:
     FrameDenoiser(const FrameDenoiser&) = delete;
     FrameDenoiser& operator=(const FrameDenoiser&) = delete;
 
-    /**
-     * @brief 从环境变量初始化降噪器
-     *
-     * 目前读取的关键环境变量:
-     * - TRYRAYTRACE_DENOISE_MODEL
-     * - TRYRAYTRACE_DENOISE_DEVICE
-     * - TRYRAYTRACE_DENOISE_INTERVAL
-     * - TRYRAYTRACE_DENOISE_INPUT_LAYOUT
-     * - TRYRAYTRACE_DENOISE_OUTPUT_LAYOUT
-     */
-    void initialize_from_env(int frame_width, int frame_height);
+    /// 初始化内置 NPU 降噪模型，并完成 OpenVINO 编译。
+    void initialize(int frame_width, int frame_height);
 
     /// 是否已成功加载模型并可执行推理。
     bool is_enabled() const;
@@ -45,6 +37,9 @@ public:
 
     /// 根据当前帧号判断这一帧是否应触发一次推理。
     bool should_run(int frame_index) const;
+
+    /// 当前帧实际采用多大比例的降噪结果做显示混合。
+    float blend_alpha(int frame_index) const;
 
     /**
      * @brief 对一帧线性 RGB 图像执行降噪

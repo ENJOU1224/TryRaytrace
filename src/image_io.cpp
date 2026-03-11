@@ -11,7 +11,7 @@
 // ======================================================================================
 // 职责:
 // 1. 将高精度的浮点累加数据 (Float RGB) 转换为 显示器用的字节数据 (Byte RGB)。
-// 2. 执行 Gamma 校正 (这是一个耗时的数学运算)。
+// 2. 执行 Tone Mapping + Gamma 校正 (这是一个耗时的数学运算)。
 // 3. 将结果以 PPM (P6) 二进制格式写入硬盘。
 // ======================================================================================
 void save_snapshot(const Vec* h_accum, int w, int h, int frame, float focus_dist, float aperture) {
@@ -43,7 +43,7 @@ void save_snapshot(const Vec* h_accum, int w, int h, int frame, float focus_dist
     // ------------------------------------------------------------------
     // 为什么这里需要 OpenMP？
     // 虽然写硬盘是 IO 瓶颈，但在写硬盘之前，我们需要对 100万+ 个像素执行 toInt()。
-    // toInt() 内部包含 pow(x, 1/2.2) 运算，这是非常昂贵的超越函数调用。
+    // toInt() 内部包含 Reinhard Tone Mapping + Gamma 运算，这是非常昂贵的超越函数调用。
     // 如果单核跑，这里可能会卡顿 20-50ms。用 OpenMP 可以压到 5ms 以内。
     
     // 申请临时缓冲区 (栈上分配 vector 对象，堆上分配数据，RAII 自动释放)
@@ -55,7 +55,7 @@ void save_snapshot(const Vec* h_accum, int w, int h, int frame, float focus_dist
         // [平均化]: 累加值 / 采样次数
         Vec avg = h_accum[i] * (1.0f / frame);
         
-        // [Gamma 校正 + 量化]
+        // [Tone Mapping + Gamma 校正 + 量化]
         // toInt 定义在 common.h 中
         unsigned char r = (unsigned char)toInt(avg.x);
         unsigned char g = (unsigned char)toInt(avg.y);

@@ -2,88 +2,172 @@
 
 #include <openvino/openvino.hpp>
 #include <openvino/core/preprocess/pre_post_process.hpp>
+#include <openvino/opsets/opset13.hpp>
 
 #include <algorithm>
-#include <cctype>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <memory>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace {
 
+constexpr const char* kDenoiseDeviceName = "NPU";
+constexpr int kDenoiseInterval = 1;
+constexpr int kMinimumFramesBeforeDenoise = 3;
+constexpr int kBlendRampEndFrame = 12;
+constexpr float kBlendAlphaMin = 0.18f;
+constexpr float kBlendAlphaMax = 0.58f;
+constexpr float kPreserveWeight = 0.82f;
+constexpr float kBlurWeight = 0.18f;
+constexpr float kFireflyGuardScale = 1.25f;
+constexpr float kFireflyGuardBias = 0.02f;
+
 /**
- * 降噪模型最常见的两种张量布局。
- * 项目内部统一向降噪器提供 NHWC，OpenVINO 负责按模型布局做转换。
+ * 将 OpenVINO 设备列表中是否存在 NPU 的判断逻辑集中起来。
+ * 这样主流程里只需要关心“能不能启用降噪”，不用重复处理字符串匹配。
  */
-enum class TensorLayout {
-    NCHW,
-    NHWC,
-};
-
-/// 读取环境变量，不存在时返回空字符串，避免主流程里充斥 nullptr 判断。
-std::string getenv_or_empty(const char* name) {
-    const char* value = std::getenv(name);
-    return value ? std::string(value) : std::string();
-}
-
-/// 解析正整数环境变量。配置非法时回退到默认值，而不是让程序直接崩掉。
-int parse_positive_int(const std::string& text, int fallback) {
-    if (text.empty()) {
-        return fallback;
-    }
-    try {
-        int value = std::stoi(text);
-        return value > 0 ? value : fallback;
-    } catch (...) {
-        return fallback;
-    }
-}
-
-/// 环境变量里的布局名允许大小写混用，这里统一转成大写。
-std::string normalize_layout_name(std::string text) {
-    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
-        return static_cast<char>(std::toupper(c));
-    });
-    return text;
-}
-
-TensorLayout layout_from_name(const std::string& layout_name) {
-    const std::string normalized = normalize_layout_name(layout_name);
-    if (normalized == "NCHW") {
-        return TensorLayout::NCHW;
-    }
-    if (normalized == "NHWC") {
-        return TensorLayout::NHWC;
-    }
-    throw std::runtime_error("只支持 NCHW 或 NHWC 布局。");
-}
-
-/// 根据模型 shape 猜输入/输出布局，优先识别通道维是否为 3。
-TensorLayout infer_layout_from_shape(const ov::PartialShape& shape, TensorLayout fallback) {
-    if (shape.rank().is_static() && shape.rank().get_length() == 4) {
-        if (shape[1].is_static() && shape[1].get_length() == 3) {
-            return TensorLayout::NCHW;
-        }
-        if (shape[3].is_static() && shape[3].get_length() == 3) {
-            return TensorLayout::NHWC;
+bool has_npu_device(ov::Core& core) {
+    const std::vector<std::string> devices = core.get_available_devices();
+    for (const std::string& device : devices) {
+        if (device.find("NPU") != std::string::npos) {
+            return true;
         }
     }
-    return fallback;
-}
-
-ov::Layout to_ov_layout(TensorLayout layout) {
-    return ov::Layout(layout == TensorLayout::NCHW ? "NCHW" : "NHWC");
+    return false;
 }
 
 /**
- * 推理结果只做“安全化”，不提前压到 [0, 1]。
- * 这样既能过滤 NaN / Inf，也不会把潜在的高亮 HDR 信息过早裁掉。
+ * 生成一个 5x5 高斯核。
+ *
+ * 这不是训练出来的参数，而是手工指定的平滑滤波器。
+ * 选它的原因很务实：
+ * 1. 卷积运算是 NPU 最擅长、也最稳定支持的一类算子。
+ * 2. 代码里直接能看懂每个权重的含义，适合教学。
+ * 3. 它对路径追踪中的高频噪点有立竿见影的抑制效果。
+ */
+std::vector<float> build_gaussian_kernel_5x5() {
+    static constexpr float kRawKernel[25] = {
+        1.0f,  4.0f,  6.0f,  4.0f, 1.0f,
+        4.0f, 16.0f, 24.0f, 16.0f, 4.0f,
+        6.0f, 24.0f, 36.0f, 24.0f, 6.0f,
+        4.0f, 16.0f, 24.0f, 16.0f, 4.0f,
+        1.0f,  4.0f,  6.0f,  4.0f, 1.0f,
+    };
+
+    std::vector<float> kernel(25);
+    for (size_t i = 0; i < kernel.size(); ++i) {
+        kernel[i] = kRawKernel[i] / 256.0f;
+    }
+    return kernel;
+}
+
+/**
+ * 生成卷积权重，形状为 [3, 3, 5, 5]。
+ *
+ * 每个输出通道只读取对应输入通道：
+ * - R 只卷积 R
+ * - G 只卷积 G
+ * - B 只卷积 B
+ *
+ * 这样可以避免跨颜色通道串扰，先把问题收敛成“对每个颜色通道分别降噪”。
+ */
+std::vector<float> build_rgb_blur_weights() {
+    const std::vector<float> gaussian = build_gaussian_kernel_5x5();
+    std::vector<float> weights(3 * 3 * 5 * 5, 0.0f);
+
+    for (int c = 0; c < 3; ++c) {
+        const size_t base = static_cast<size_t>((c * 3 + c) * 25);
+        std::copy(gaussian.begin(), gaussian.end(), weights.begin() + static_cast<long>(base));
+    }
+    return weights;
+}
+
+/// 构造 [1, 3, 1, 1] 常量，用于对三个颜色通道做同权重缩放。
+std::vector<float> build_channel_scale(float value) {
+    return std::vector<float>{value, value, value};
+}
+
+/**
+ * 构建内置轻量降噪模型。
+ *
+ * 模型结构很简单：
+ * input
+ *   -> 5x5 Gaussian Conv -> blurred
+ *   -> firefly guard: min(input, blurred * 1.25 + 0.02) -> guarded
+ *   -> 5x5 Gaussian Conv(guarded) -> refined
+ * guarded * 0.82 + refined * 0.18 -> output
+ *
+ * 这本质上是一个固定权重的“异常高亮保护 + 残差卷积”网络。
+ * 它不是追求极限效果的 SOTA 模型，而是一个非常适合当前项目阶段的工程基线：
+ * - 不依赖外部模型文件
+ * - 算子集合极小，NPU 兼容性高
+ * - 代码可读性强，适合学习 OpenVINO 图构建
+ * - 对 fireflies 比单纯模糊更克制
+ */
+std::shared_ptr<ov::Model> build_builtin_denoise_model(int frame_height, int frame_width) {
+    using namespace ov::opset13;
+
+    auto input = std::make_shared<Parameter>(ov::element::f32,
+                                             ov::Shape{1, 3, static_cast<size_t>(frame_height), static_cast<size_t>(frame_width)});
+
+    const std::vector<float> blur_weights_data = build_rgb_blur_weights();
+    auto blur_weights = std::make_shared<Constant>(ov::element::f32,
+                                                   ov::Shape{3, 3, 5, 5},
+                                                   blur_weights_data.data());
+
+    auto blurred = std::make_shared<Convolution>(input->output(0),
+                                                 blur_weights->output(0),
+                                                 ov::Strides{1, 1},
+                                                 ov::CoordinateDiff{2, 2},
+                                                 ov::CoordinateDiff{2, 2},
+                                                 ov::Strides{1, 1});
+
+    const std::vector<float> firefly_scale_data = build_channel_scale(kFireflyGuardScale);
+    auto firefly_scale = std::make_shared<Constant>(ov::element::f32,
+                                                    ov::Shape{1, 3, 1, 1},
+                                                    firefly_scale_data.data());
+
+    const std::vector<float> firefly_bias_data = build_channel_scale(kFireflyGuardBias);
+    auto firefly_bias = std::make_shared<Constant>(ov::element::f32,
+                                                   ov::Shape{1, 3, 1, 1},
+                                                   firefly_bias_data.data());
+
+    auto firefly_limit_scaled = std::make_shared<Multiply>(blurred->output(0), firefly_scale->output(0));
+    auto firefly_limit = std::make_shared<Add>(firefly_limit_scaled->output(0), firefly_bias->output(0));
+    auto guarded = std::make_shared<Minimum>(input->output(0), firefly_limit->output(0));
+
+    auto refined = std::make_shared<Convolution>(guarded->output(0),
+                                                 blur_weights->output(0),
+                                                 ov::Strides{1, 1},
+                                                 ov::CoordinateDiff{2, 2},
+                                                 ov::CoordinateDiff{2, 2},
+                                                 ov::Strides{1, 1});
+
+    const std::vector<float> preserve_scale_data = build_channel_scale(kPreserveWeight);
+    auto preserve_scale = std::make_shared<Constant>(ov::element::f32,
+                                                     ov::Shape{1, 3, 1, 1},
+                                                     preserve_scale_data.data());
+
+    const std::vector<float> blur_scale_data = build_channel_scale(kBlurWeight);
+    auto blur_scale = std::make_shared<Constant>(ov::element::f32,
+                                                 ov::Shape{1, 3, 1, 1},
+                                                 blur_scale_data.data());
+
+    auto preserved = std::make_shared<Multiply>(guarded->output(0), preserve_scale->output(0));
+    auto refined_scaled = std::make_shared<Multiply>(refined->output(0), blur_scale->output(0));
+    auto output = std::make_shared<Add>(preserved->output(0), refined_scaled->output(0));
+    output->get_output_tensor(0).set_names({"denoised_rgb"});
+
+    auto result = std::make_shared<Result>(output->output(0));
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input}, "builtin_npu_denoiser");
+}
+
+/**
+ * 推理结果做最基础的数值清理。
+ * 这里不做 Gamma，也不主动裁掉高亮，只过滤明显错误值。
  */
 void sanitize_rgb(std::vector<float>& buffer) {
     for (float& value : buffer) {
@@ -95,65 +179,13 @@ void sanitize_rgb(std::vector<float>& buffer) {
     }
 }
 
-/// 用于把模型输出重新映射回窗口分辨率，避免要求模型分辨率必须与渲染分辨率完全一致。
-void resize_rgb_bilinear(const float* src,
-                         int src_width,
-                         int src_height,
-                         float* dst,
-                         int dst_width,
-                         int dst_height) {
-    if (src_width == dst_width && src_height == dst_height) {
-        std::memcpy(dst, src, static_cast<size_t>(src_width) * src_height * 3 * sizeof(float));
-        return;
-    }
-
-    const float scale_x = static_cast<float>(src_width) / static_cast<float>(dst_width);
-    const float scale_y = static_cast<float>(src_height) / static_cast<float>(dst_height);
-
-    for (int y = 0; y < dst_height; ++y) {
-        const float src_y = (static_cast<float>(y) + 0.5f) * scale_y - 0.5f;
-        const int y0 = std::clamp(static_cast<int>(std::floor(src_y)), 0, src_height - 1);
-        const int y1 = std::min(y0 + 1, src_height - 1);
-        const float wy = src_y - static_cast<float>(y0);
-
-        for (int x = 0; x < dst_width; ++x) {
-            const float src_x = (static_cast<float>(x) + 0.5f) * scale_x - 0.5f;
-            const int x0 = std::clamp(static_cast<int>(std::floor(src_x)), 0, src_width - 1);
-            const int x1 = std::min(x0 + 1, src_width - 1);
-            const float wx = src_x - static_cast<float>(x0);
-
-            const size_t dst_base = static_cast<size_t>(y * dst_width + x) * 3;
-            const size_t idx00 = static_cast<size_t>(y0 * src_width + x0) * 3;
-            const size_t idx01 = static_cast<size_t>(y0 * src_width + x1) * 3;
-            const size_t idx10 = static_cast<size_t>(y1 * src_width + x0) * 3;
-            const size_t idx11 = static_cast<size_t>(y1 * src_width + x1) * 3;
-
-            for (int c = 0; c < 3; ++c) {
-                const float top = src[idx00 + c] * (1.0f - wx) + src[idx01 + c] * wx;
-                const float bottom = src[idx10 + c] * (1.0f - wx) + src[idx11 + c] * wx;
-                dst[dst_base + c] = top * (1.0f - wy) + bottom * wy;
-            }
-        }
-    }
-}
-
 }  // namespace
 
-/**
- * 具体实现体放在 .cpp 里，目的是:
- * 1. 隐藏 OpenVINO 头文件和实现细节，减少编译耦合。
- * 2. 给后续异步化、缓存多路 infer request 留空间。
- */
 struct FrameDenoiser::Impl {
     bool enabled = false;
     bool has_output = false;
     int frame_width = 0;
     int frame_height = 0;
-    int infer_interval = 1;
-    int model_output_width = 0;
-    int model_output_height = 0;
-    std::string model_path;
-    std::string device = "NPU";
     std::string status;
     std::vector<float> output_rgb;
 
@@ -161,104 +193,48 @@ struct FrameDenoiser::Impl {
     ov::CompiledModel compiled_model;
     ov::InferRequest infer_request;
 
-    /// 根据环境变量加载模型并配置预处理/后处理。
-    void initialize_from_env(int width, int height) {
+    void initialize(int width, int height) {
         frame_width = width;
         frame_height = height;
         enabled = false;
         has_output = false;
         output_rgb.clear();
 
-        model_path = getenv_or_empty("TRYRAYTRACE_DENOISE_MODEL");
-        device = getenv_or_empty("TRYRAYTRACE_DENOISE_DEVICE");
-        if (device.empty()) {
-            device = "NPU";
-        }
-        infer_interval = parse_positive_int(getenv_or_empty("TRYRAYTRACE_DENOISE_INTERVAL"), 1);
-
-        if (model_path.empty()) {
-            status = "[降噪] 未设置 TRYRAYTRACE_DENOISE_MODEL，当前使用原始渲染画面。";
-            return;
-        }
-
-        if (!std::filesystem::exists(model_path)) {
-            status = "[降噪] 模型文件不存在：" + model_path + "，当前使用原始渲染画面。";
+        if (!has_npu_device(core)) {
+            status = "[降噪] 未检测到 OpenVINO NPU 设备，已禁用内置降噪。";
             return;
         }
 
         try {
-            // 第一步：读取模型并做最基本的结构约束检查。
-            // 这里故意只支持“单输入 + 单输出”的图像模型，
-            // 目的是先把渲染管线接通，避免一开始就引入多输入辅助特征图的复杂度。
-            auto model = core.read_model(model_path);
-            if (model->inputs().size() != 1 || model->outputs().size() != 1) {
-                throw std::runtime_error("当前只支持单输入单输出的图像降噪模型。");
-            }
+            auto model = build_builtin_denoise_model(height, width);
 
-            // 第二步：确定模型输入/输出布局。
-            // 项目内部统一使用 NHWC 连续内存，模型若是 NCHW，则交给 OpenVINO 自动插入转置。
-            TensorLayout input_layout = TensorLayout::NCHW;
-            const std::string input_layout_env = getenv_or_empty("TRYRAYTRACE_DENOISE_INPUT_LAYOUT");
-            if (!input_layout_env.empty()) {
-                input_layout = layout_from_name(input_layout_env);
-            } else {
-                input_layout = infer_layout_from_shape(model->input().get_partial_shape(), TensorLayout::NCHW);
-            }
-
-            TensorLayout output_layout = input_layout;
-            const std::string output_layout_env = getenv_or_empty("TRYRAYTRACE_DENOISE_OUTPUT_LAYOUT");
-            if (!output_layout_env.empty()) {
-                output_layout = layout_from_name(output_layout_env);
-            } else {
-                output_layout = infer_layout_from_shape(model->output().get_partial_shape(), input_layout);
-            }
-
-            // 第三步：构建 OpenVINO 的预处理/后处理链。
-            // 这里做的事情分别是：
-            // 1. 告诉 Runtime：应用侧喂进来的是 NHWC、float32、分辨率为当前窗口大小。
-            // 2. 告诉 Runtime：模型内部真正期望的布局是 NCHW 还是 NHWC。
-            // 3. 若模型输入分辨率与窗口不一致，自动插入 resize。
-            // 4. 模型输出无论内部布局如何，最终都转回 NHWC float32，方便 SDL 显示。
+            // 应用侧维持 NHWC 连续内存，模型内部使用更常见的 NCHW。
+            // 这一步把布局转换交给 OpenVINO 的预处理图完成。
             ov::preprocess::PrePostProcessor ppp(model);
             ppp.input().tensor()
                 .set_element_type(ov::element::f32)
                 .set_layout("NHWC")
                 .set_shape(ov::PartialShape{1, height, width, 3});
-            ppp.input().model().set_layout(to_ov_layout(input_layout));
-            ppp.input().preprocess().resize(ov::preprocess::ResizeAlgorithm::RESIZE_LINEAR);
+            ppp.input().model().set_layout(ov::Layout("NCHW"));
 
-            ppp.output().model().set_layout(to_ov_layout(output_layout));
-            ppp.output().postprocess().convert_layout(ov::Layout("NHWC")).convert_element_type(ov::element::f32);
-            ppp.output().tensor().set_layout("NHWC").set_element_type(ov::element::f32);
+            ppp.output().model().set_layout(ov::Layout("NCHW"));
+            ppp.output().postprocess()
+                .convert_layout(ov::Layout("NHWC"))
+                .convert_element_type(ov::element::f32);
+            ppp.output().tensor()
+                .set_layout("NHWC")
+                .set_element_type(ov::element::f32);
 
             model = ppp.build();
-
-            // 第四步：将模型真正编译到目标设备。
-            // 默认目标是 NPU；如果 NPU 不支持当前模型，这一步会抛异常并自动回退。
-            compiled_model = core.compile_model(model, device);
+            compiled_model = core.compile_model(model, kDenoiseDeviceName);
             infer_request = compiled_model.create_infer_request();
 
-            const ov::Shape output_shape = infer_request.get_output_tensor().get_shape();
-            if (output_shape.size() != 4 || output_shape[0] != 1 || output_shape[3] != 3) {
-                throw std::runtime_error("模型输出不是 1xHxWx3 的 RGB 图像。");
-            }
-
-            model_output_height = static_cast<int>(output_shape[1]);
-            model_output_width = static_cast<int>(output_shape[2]);
-            output_rgb.resize(static_cast<size_t>(frame_width) * frame_height * 3);
+            output_rgb.resize(static_cast<size_t>(frame_width) * frame_height * 3, 0.0f);
             enabled = true;
-
-            std::ostringstream oss;
-            oss << "[降噪] 已加载模型：" << model_path
-                << " | 设备：" << device
-                << " | 推理间隔：" << infer_interval << " 帧";
-            if (model_output_width != frame_width || model_output_height != frame_height) {
-                oss << " | 模型输出：" << model_output_width << "x" << model_output_height
-                    << "，显示时会缩放回 " << frame_width << "x" << frame_height;
-            }
-            status = oss.str();
+            status =
+                "[降噪] 已启用内置 OpenVINO NPU 降噪器：5x5 高斯残差卷积，输入输出为当前窗口分辨率。";
         } catch (const std::exception& ex) {
-            status = std::string("[降噪] 初始化失败，已回退到原始画面：") + ex.what();
+            status = std::string("[降噪] NPU 降噪初始化失败，已回退到原始画面：") + ex.what();
             enabled = false;
             has_output = false;
         }
@@ -268,7 +244,10 @@ struct FrameDenoiser::Impl {
         if (!enabled) {
             return false;
         }
-        return !has_output || (frame_index % infer_interval == 0);
+        if (frame_index < kMinimumFramesBeforeDenoise) {
+            return false;
+        }
+        return !has_output || (frame_index % kDenoiseInterval == 0);
     }
 
     bool run(const float* input_rgb_nhwc, int width, int height) {
@@ -276,15 +255,13 @@ struct FrameDenoiser::Impl {
             return false;
         }
         if (width != frame_width || height != frame_height) {
-            status = "[降噪] 当前实现只支持固定渲染分辨率，分辨率变化后已关闭降噪。";
+            status = "[降噪] 当前实现只支持固定渲染分辨率，检测到尺寸变化后已关闭降噪。";
             enabled = false;
             has_output = false;
             return false;
         }
 
         try {
-            // 每一帧都直接把应用侧的线性 RGB 缓冲区包装成 OpenVINO Tensor。
-            // 这里不额外复制输入数据，目的是让主循环里的 CPU 开销尽量小。
             ov::Tensor input_tensor(ov::element::f32,
                                     ov::Shape{1, static_cast<size_t>(height), static_cast<size_t>(width), 3},
                                     const_cast<float*>(input_rgb_nhwc));
@@ -292,27 +269,12 @@ struct FrameDenoiser::Impl {
             infer_request.infer();
 
             const ov::Tensor result = infer_request.get_output_tensor();
-            const float* result_data = result.data<const float>();
-            if (model_output_width == frame_width && model_output_height == frame_height) {
-                // 输出分辨率与窗口一致时，直接拷贝即可。
-                std::memcpy(output_rgb.data(),
-                            result_data,
-                            output_rgb.size() * sizeof(float));
-            } else {
-                // 如果模型输出的是固定小分辨率，这里统一放大回窗口尺寸。
-                resize_rgb_bilinear(result_data,
-                                    model_output_width,
-                                    model_output_height,
-                                    output_rgb.data(),
-                                    frame_width,
-                                    frame_height);
-            }
-
+            std::memcpy(output_rgb.data(), result.data<const float>(), output_rgb.size() * sizeof(float));
             sanitize_rgb(output_rgb);
             has_output = true;
             return true;
         } catch (const std::exception& ex) {
-            status = std::string("[降噪] 推理失败，已回退到原始画面：") + ex.what();
+            status = std::string("[降噪] NPU 推理失败，已回退到原始画面：") + ex.what();
             enabled = false;
             has_output = false;
             return false;
@@ -332,8 +294,8 @@ FrameDenoiser::FrameDenoiser(FrameDenoiser&& other) noexcept = default;
 
 FrameDenoiser& FrameDenoiser::operator=(FrameDenoiser&& other) noexcept = default;
 
-void FrameDenoiser::initialize_from_env(int frame_width, int frame_height) {
-    impl_->initialize_from_env(frame_width, frame_height);
+void FrameDenoiser::initialize(int frame_width, int frame_height) {
+    impl_->initialize(frame_width, frame_height);
 }
 
 bool FrameDenoiser::is_enabled() const {
@@ -346,6 +308,20 @@ bool FrameDenoiser::has_output() const {
 
 bool FrameDenoiser::should_run(int frame_index) const {
     return impl_ && impl_->should_run(frame_index);
+}
+
+float FrameDenoiser::blend_alpha(int frame_index) const {
+    if (!impl_ || !impl_->enabled || frame_index < kMinimumFramesBeforeDenoise) {
+        return 0.0f;
+    }
+
+    if (frame_index >= kBlendRampEndFrame) {
+        return kBlendAlphaMax;
+    }
+
+    const float t = static_cast<float>(frame_index - kMinimumFramesBeforeDenoise) /
+                    static_cast<float>(std::max(1, kBlendRampEndFrame - kMinimumFramesBeforeDenoise));
+    return kBlendAlphaMin + (kBlendAlphaMax - kBlendAlphaMin) * std::clamp(t, 0.0f, 1.0f);
 }
 
 bool FrameDenoiser::run(const float* input_rgb_nhwc, int frame_width, int frame_height) {
@@ -367,5 +343,6 @@ const std::string& FrameDenoiser::status() const {
 }
 
 const std::string& FrameDenoiser::device_name() const {
-    return impl_->device;
+    static const std::string kDeviceName = kDenoiseDeviceName;
+    return kDeviceName;
 }

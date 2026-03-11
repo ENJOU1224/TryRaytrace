@@ -18,9 +18,9 @@
   - **鲁棒性防火墙**: 内置 NaN/Inf 过滤与负值清理。
   - **实时反馈**: 实时 FPS 统计、终端渲染进度刷新及自动 Snapshot/Log 保存。
 - **NPU 帧降噪接口**:
-  - 基于 OpenVINO C++ Runtime，可将单输入单输出 RGB 图像模型部署到 `NPU`。
-  - 当前实现支持 `NCHW/NHWC` 两类 4D 图像张量，并在显示前对输出做布局转换与缩放。
-  - 未配置模型时，渲染器会自动回退到原始画面，不影响主渲染流程。
+  - 基于 OpenVINO C++ Runtime，在程序内直接构建轻量卷积降噪图并编译到 `NPU`。
+  - 当前内置模型是一个 `5x5` 高斯残差卷积降噪器，输入输出均为当前窗口分辨率。
+  - 若未检测到 `NPU` 或 NPU 编译失败，渲染器会自动回退到原始画面，不影响主渲染流程。
 
 ## 🛠️ 环境需求
 
@@ -57,28 +57,21 @@
 
 ## 🧠 NPU 降噪使用方式
 
-渲染器不会自带降噪模型。要启用 NPU 帧降噪，请在运行前设置模型路径：
+当前版本不需要额外模型文件，也不依赖环境变量开关。运行逻辑固定如下：
 
-```bash
-export TRYRAYTRACE_DENOISE_MODEL=/path/to/your_denoise_model.xml
-export TRYRAYTRACE_DENOISE_DEVICE=NPU
-export TRYRAYTRACE_DENOISE_INTERVAL=1
-./bin/sycl_engine
-```
+1. 程序启动时先用 OpenVINO 查询当前是否存在 `NPU` 设备。
+2. 如果存在，就在内存中构建一个轻量残差卷积降噪图，并编译到 `NPU`。
+3. 每帧先把路径追踪累积结果整理成线性 `RGB`，再送进 NPU 降噪。
+4. 如果没有检测到 `NPU`，或编译 / 推理失败，就直接显示原始画面。
 
-可选环境变量：
+内置模型说明：
 
-- `TRYRAYTRACE_DENOISE_MODEL`: OpenVINO IR/ONNX 模型路径，未设置时自动关闭降噪。
-- `TRYRAYTRACE_DENOISE_DEVICE`: 推理设备，默认 `NPU`。
-- `TRYRAYTRACE_DENOISE_INTERVAL`: 每隔多少帧执行一次降噪，默认 `1`。
-- `TRYRAYTRACE_DENOISE_INPUT_LAYOUT`: 手动指定模型输入布局，支持 `NCHW` / `NHWC`。
-- `TRYRAYTRACE_DENOISE_OUTPUT_LAYOUT`: 手动指定模型输出布局，支持 `NCHW` / `NHWC`。
-
-模型约束：
-
-- 仅支持单输入单输出模型。
-- 输入输出都应表示 3 通道 RGB 图像。
-- 如果模型输出分辨率与窗口分辨率不同，程序会在显示前缩放回当前窗口大小。
+- 模型结构是 `input -> 5x5 Gaussian Conv -> residual blend -> output`
+- 残差融合比例固定为 `0.62 * 原图 + 0.38 * 平滑结果`
+- 这个模型不是追求极限画质的 SOTA 网络，而是为了当前项目阶段选择的稳定工程基线：
+  - 不依赖外部模型文件
+  - 算子非常简单，NPU 兼容性高
+  - 代码可直接阅读，适合学习 OpenVINO 图构建与 NPU 部署
 
 ## 🎮 操作快捷键
 

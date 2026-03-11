@@ -2,6 +2,8 @@
 #include "common.h"
 #include "scene.h"
 #include "bvh.h"
+#include <cstdint>
+#include <sycl/sycl.hpp>
 #include <vector>
 #include <string>
 
@@ -17,6 +19,39 @@
 
 // 渲染器初始化逻辑
 void init_renderer_sycl();
+
+/// 返回渲染器内部实际使用的 SYCL 队列，便于主程序与内核共享同一上下文。
+sycl::queue& get_renderer_queue();
+
+/**
+ * @brief 路径追踪诊断统计
+ *
+ * 这些计数器的目标不是做最终性能监控，而是帮助定位 fireflies 的来源：
+ * 1. 直接光贡献是否经常爆亮；
+ * 2. throughput 是否在某个 BSDF 分支中失控；
+ * 3. 最终颜色是否仍然经常触发兜底 firefly clamp。
+ */
+struct RenderStats {
+    uint32_t nan_or_inf_pixels = 0;
+    uint32_t direct_light_clamp_count = 0;
+    uint32_t emissive_hit_clamp_count = 0;
+    uint32_t emissive_hit_primary_count = 0;
+    uint32_t emissive_hit_indirect_count = 0;
+    uint32_t emissive_hit_primary_clamp_count = 0;
+    uint32_t emissive_hit_indirect_clamp_count = 0;
+    uint32_t throughput_clamp_diffuse_count = 0;
+    uint32_t throughput_clamp_specular_count = 0;
+    uint32_t throughput_clamp_refract_count = 0;
+    uint32_t throughput_clamp_rr_count = 0;
+    uint32_t final_firefly_clamp_count = 0;
+
+    uint32_t max_direct_light_lum_milli = 0;
+    uint32_t max_emissive_hit_lum_milli = 0;
+    uint32_t max_emissive_hit_primary_lum_milli = 0;
+    uint32_t max_emissive_hit_indirect_lum_milli = 0;
+    uint32_t max_throughput_component_milli = 0;
+    uint32_t max_final_color_lum_milli = 0;
+};
 
 /**
  * @brief 初始化并上传场景数据
@@ -41,5 +76,13 @@ void init_scene_data(const std::vector<Object>& objects,
  * @param tx 工作组宽度 (建议针对 Intel GPU 设为 16)
  * @param ty 工作组高度 (建议针对 Intel GPU 设为 8)
  * @param cam 相机参数 (位置、视角等)
+ * @param stats_usm 诊断统计缓冲区 (必须是 USM Shared 类型，可为空)
  */
-void launch_render_kernel(Vec* accum_buffer_usm, int width, int height, int frame_seed, int tx, int ty, CameraParams cam);
+void launch_render_kernel(Vec* accum_buffer_usm,
+                          int width,
+                          int height,
+                          int frame_seed,
+                          int tx,
+                          int ty,
+                          CameraParams cam,
+                          RenderStats* stats_usm);

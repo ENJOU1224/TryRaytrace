@@ -30,6 +30,16 @@ void signal_handler(int signal) { if (signal == SIGINT) quit = true; }
 
 namespace {
 
+// 默认运行策略：
+// 1. 正常使用时开启 NPU 降噪。
+// 2. 诊断统计默认关闭，避免终端刷屏，也避免内核里频繁原子操作带来的额外开销。
+constexpr bool kEnableNpuDenoiser = true;
+constexpr bool kEnableDiagnosticStats = false;
+
+float milli_to_float(uint32_t milli_value) {
+    return static_cast<float>(milli_value) / 1000.0f;
+}
+
 /**
  * 将路径追踪累积缓冲区转换为“线性 RGB 帧”。
  *
@@ -49,18 +59,36 @@ void build_linear_rgb_frame(const Vec* accum, int pixel_count, int frame_index, 
 
 /**
  * 将线性 RGB 图像转换成 SDL 纹理可直接显示的 ARGB8888。
- * 这里才执行 Gamma 校正，保证“推理输入”和“显示输出”职责分离。
+ * 这里才执行 Tone Mapping + Gamma，保证“推理输入”和“显示输出”职责分离。
  */
 void linear_rgb_to_argb8888(const float* rgb_buffer, int pixel_count, uint32_t* pixel_buffer) {
     #pragma omp parallel for
     for (int i = 0; i < pixel_count; ++i) {
-        const float r = std::pow(clamp(rgb_buffer[i * 3 + 0]), 1.0f / 2.2f);
-        const float g = std::pow(clamp(rgb_buffer[i * 3 + 1]), 1.0f / 2.2f);
-        const float b = std::pow(clamp(rgb_buffer[i * 3 + 2]), 1.0f / 2.2f);
+        const float r = encode_display_value(rgb_buffer[i * 3 + 0]);
+        const float g = encode_display_value(rgb_buffer[i * 3 + 1]);
+        const float b = encode_display_value(rgb_buffer[i * 3 + 2]);
         pixel_buffer[i] = (255 << 24) |
                           (static_cast<uint32_t>(r * 255.0f + 0.5f) << 16) |
                           (static_cast<uint32_t>(g * 255.0f + 0.5f) << 8) |
                           static_cast<uint32_t>(b * 255.0f + 0.5f);
+    }
+}
+
+/**
+ * 将原图与降噪结果做渐进混合。
+ *
+ * 设计原因:
+ * 1. 低采样帧数时，降噪结果不一定稳定，直接全量替换很容易“首帧劣化”。
+ * 2. 通过 alpha 逐步抬高，可以让用户先看到可信的原图，再慢慢引入 NPU 平滑结果。
+ */
+void blend_linear_rgb(const float* original_rgb,
+                      const float* denoised_rgb,
+                      float alpha,
+                      int pixel_count,
+                      std::vector<float>& blended_rgb) {
+    #pragma omp parallel for
+    for (int i = 0; i < pixel_count * 3; ++i) {
+        blended_rgb[i] = original_rgb[i] * (1.0f - alpha) + denoised_rgb[i] * alpha;
     }
 }
 
@@ -114,25 +142,31 @@ int main(int argc, char** argv) {
     CameraController cam({50, 50, 295.6}, {0, 0, -1});
 
     // 3. 运行时资源准备
-    // 自动选择最佳 SYCL 设备 (优先 Level Zero GPU)
-    sycl::queue q;
-    try { 
-        q = sycl::queue(sycl::gpu_selector_v); 
-    } catch (...) { 
-        q = sycl::queue(sycl::cpu_selector_v); 
-    }
+    // 主线程与渲染内核共用同一个队列，避免 USM 分配和内核执行分属不同上下文。
+    sycl::queue& q = get_renderer_queue();
 
     // 分配 USM Shared Memory：CPU 与 GPU 物理共享，零拷贝访问
     Vec* d_accum = sycl::malloc_shared<Vec>(w * h, q);
     std::memset(d_accum, 0, w * h * sizeof(Vec));
+    RenderStats* render_stats = nullptr;
+    if (kEnableDiagnosticStats) {
+        render_stats = sycl::malloc_shared<RenderStats>(1, q);
+        *render_stats = {};
+    }
     
     // CPU 侧像素映射缓冲区 (用于 SDL 显示)
     uint32_t* pixel_buffer = (uint32_t*)malloc(w * h * sizeof(uint32_t));
     std::vector<float> linear_rgb_frame(w * h * 3, 0.0f);
+    std::vector<float> blended_rgb_frame(w * h * 3, 0.0f);
 
     FrameDenoiser denoiser;
-    denoiser.initialize_from_env(w, h);
-    std::string last_denoiser_status = denoiser.status();
+    std::string last_denoiser_status;
+    if (kEnableNpuDenoiser) {
+        denoiser.initialize(w, h);
+        last_denoiser_status = denoiser.status();
+    } else {
+        last_denoiser_status = "[系统] 当前已关闭 NPU 降噪。";
+    }
     if (!last_denoiser_status.empty()) {
         std::cout << last_denoiser_status << std::endl;
     }
@@ -161,26 +195,43 @@ int main(int argc, char** argv) {
         if (state.camera_moved) {
             gpu_frame = 1;
             std::memset(d_accum, 0, w * h * sizeof(Vec));
-            denoiser.reset();
+            if (kEnableNpuDenoiser) {
+                denoiser.reset();
+            }
         }
 
         // [B] 发射渲染内核
         CameraParams cam_params = cam.get_params(w, h);
         // 建议 tx=16, ty=8 以匹配 Intel Xe2 硬件 Sub-group 布局
-        launch_render_kernel(d_accum, w, h, gpu_frame, 16, 8, cam_params);
+        if (render_stats) {
+            *render_stats = {};
+        }
+        launch_render_kernel(d_accum, w, h, gpu_frame, 16, 8, cam_params, render_stats);
         
         // [C] 图像后处理与 NPU 降噪
         build_linear_rgb_frame(d_accum, w * h, gpu_frame, linear_rgb_frame);
 
-        if (denoiser.should_run(gpu_frame) && !denoiser.run(linear_rgb_frame.data(), w, h)) {
+        if (kEnableNpuDenoiser &&
+            denoiser.should_run(gpu_frame) &&
+            !denoiser.run(linear_rgb_frame.data(), w, h)) {
             if (denoiser.status() != last_denoiser_status) {
                 std::cout << denoiser.status() << std::endl;
                 last_denoiser_status = denoiser.status();
             }
         }
 
-        const float* active_rgb = denoiser.has_output() ? denoiser.output_rgb().data()
-                                                        : linear_rgb_frame.data();
+        const float* active_rgb = linear_rgb_frame.data();
+        if (kEnableNpuDenoiser && denoiser.has_output()) {
+            const float alpha = denoiser.blend_alpha(gpu_frame);
+            if (alpha > 0.0f) {
+                blend_linear_rgb(linear_rgb_frame.data(),
+                                 denoiser.output_rgb().data(),
+                                 alpha,
+                                 w * h,
+                                 blended_rgb_frame);
+                active_rgb = blended_rgb_frame.data();
+            }
+        }
         linear_rgb_to_argb8888(active_rgb, w * h, pixel_buffer);
 
         // [D] 更新 SDL 屏幕
@@ -197,15 +248,36 @@ int main(int argc, char** argv) {
 
         if (gpu_frame % 5 == 0) {
             char title[256];
-            sprintf(title, "[%s] FPS: %.1f | Frame: %d | F: %.1f | A: %.2f | Denoise: %s", 
+            sprintf(title, "[%s] FPS: %.1f | Frame: %d | Denoise: %s",
                     q.get_device().get_info<sycl::info::device::name>().c_str(),
-                    fps, gpu_frame, cam.get_focus_dist(), cam.get_aperture(),
-                    denoiser.is_enabled() ? denoiser.device_name().c_str() : "OFF");
+                    fps, gpu_frame,
+                    (kEnableNpuDenoiser && denoiser.is_enabled()) ? denoiser.device_name().c_str() : "OFF");
             SDL_SetWindowTitle(window, title);
 
-            // 命令行进度刷新
-            printf("\r>> [SYCL] Rendering: Frame %d | FPS: %.1f", gpu_frame, fps);
-            fflush(stdout);
+            if (kEnableDiagnosticStats && render_stats) {
+                printf("\r>> [SYCL] Frame %d | FPS: %.1f | Clamp[DL:%u EH:%u(P:%u I:%u) TPd:%u TPs:%u TPr:%u TPrr:%u F:%u NaN:%u] | Hit[EH P:%u I:%u] | Max[DL:%.2f EH:%.2f(P:%.2f I:%.2f) TP:%.2f C:%.2f]",
+                       gpu_frame,
+                       fps,
+                       render_stats->direct_light_clamp_count,
+                       render_stats->emissive_hit_clamp_count,
+                       render_stats->emissive_hit_primary_clamp_count,
+                       render_stats->emissive_hit_indirect_clamp_count,
+                       render_stats->throughput_clamp_diffuse_count,
+                       render_stats->throughput_clamp_specular_count,
+                       render_stats->throughput_clamp_refract_count,
+                       render_stats->throughput_clamp_rr_count,
+                       render_stats->final_firefly_clamp_count,
+                       render_stats->nan_or_inf_pixels,
+                       render_stats->emissive_hit_primary_count,
+                       render_stats->emissive_hit_indirect_count,
+                       milli_to_float(render_stats->max_direct_light_lum_milli),
+                       milli_to_float(render_stats->max_emissive_hit_lum_milli),
+                       milli_to_float(render_stats->max_emissive_hit_primary_lum_milli),
+                       milli_to_float(render_stats->max_emissive_hit_indirect_lum_milli),
+                       milli_to_float(render_stats->max_throughput_component_milli),
+                       milli_to_float(render_stats->max_final_color_lum_milli));
+                fflush(stdout);
+            }
         }
         gpu_frame++;
     }
@@ -215,6 +287,9 @@ int main(int argc, char** argv) {
 
     // 5. 资源清理
     sycl::free(d_accum, q); 
+    if (render_stats) {
+        sycl::free(render_stats, q);
+    }
     free(pixel_buffer);
     SDL_DestroyTexture(texture); 
     SDL_DestroyRenderer(renderer); 

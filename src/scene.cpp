@@ -39,13 +39,14 @@ Scene create_cornell_box() {
     // 7. 灯
     scene.objects.push_back({.v0={30,99.9,30}, .v1={70,99.9,30}, .v2={50,99.9,50}, .albedo=black, .emission=light_color, .metallic=wall_m, .roughness=wall_r, .ior=1.45f, .transmission=0.0f, .tex_id=-1});
 
-    // 茶壶模型：默认非镜面，如果想要镜面可以手动调参数
-    load_obj("assets/teapot.obj", scene.objects, 
-             {50.0f, 10.0f, 50.0f}, 
-             10.0f, white, 
-             1.0f, // metallic
-             0.0f  // roughness (1.0 = 完全漫反射)
-    );                 
+    // 茶壶模型：
+    // 现在把茶壶加回来，但保留“粗糙非金属墙面纯漫反射”那条修正。
+    // 这样可以验证当前剩下的高亮异常，是否已经收敛成茶壶附近的局部镜面高方差。
+    load_obj("assets/teapot.obj", scene.objects,
+             {50.0f, 10.0f, 50.0f},
+             10.0f, white,
+             1.0f,
+             0.0f);
 
     printf("[Scene] Scene created with %lu objects.\n", scene.objects.size());
     scene.world_bound = AABB::empty();

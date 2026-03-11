@@ -25,6 +25,12 @@ static LinearBVHNode* d_bvh_nodes = nullptr;
 static int* d_light_indices = nullptr;
 static int d_light_count = 0;
 
+constexpr float kDirectLightLumLimit = 3.0f;
+constexpr float kEmissiveHitLumLimit = 4.0f;
+constexpr float kThroughputMaxComponent = 4.0f;
+constexpr float kFinalFireflyLumLimit = 2.0f;
+constexpr bool kApplyFinalFireflyClamp = true;
+
 /**
  * @brief 高性能 Hash 随机数生成器 (PCG 算法简化版)
  * 用于生成像素内采样和 BSDF 反射所需的白噪声
@@ -59,11 +65,101 @@ HOST_DEVICE Vec fresnel_schlick(float cos_theta, Vec f0) {
     return f0 + (Vec{1,1,1} - f0) * x5;
 }
 
+HOST_DEVICE float luminance(const Vec& color) {
+    return color.x * 0.2126f + color.y * 0.7152f + color.z * 0.0722f;
+}
+
+HOST_DEVICE float max_component(const Vec& color) {
+    return fmax_wrapper(color.x, fmax_wrapper(color.y, color.z));
+}
+
+HOST_DEVICE uint32_t encode_milli(float value) {
+    float safe = value < 0.0f ? 0.0f : value;
+    return static_cast<uint32_t>(safe * 1000.0f + 0.5f);
+}
+
+HOST_DEVICE void stats_increment(uint32_t* counter) {
+    sycl::atomic_ref<uint32_t,
+                     sycl::memory_order::relaxed,
+                     sycl::memory_scope::device,
+                     sycl::access::address_space::global_space> atomic_counter(*counter);
+    atomic_counter.fetch_add(1);
+}
+
+HOST_DEVICE void stats_update_max(uint32_t* counter, float value) {
+    sycl::atomic_ref<uint32_t,
+                     sycl::memory_order::relaxed,
+                     sycl::memory_scope::device,
+                     sycl::access::address_space::global_space> atomic_counter(*counter);
+    atomic_counter.fetch_max(encode_milli(value));
+}
+
+HOST_DEVICE Vec clamp_direct_light(Vec contribution, RenderStats* stats) {
+    const float lum = luminance(contribution);
+    if (stats) {
+        stats_update_max(&stats->max_direct_light_lum_milli, lum);
+    }
+    if (lum > kDirectLightLumLimit) {
+        if (stats) {
+            stats_increment(&stats->direct_light_clamp_count);
+        }
+        contribution = contribution * (kDirectLightLumLimit / lum);
+    }
+    return contribution;
+}
+
+HOST_DEVICE Vec clamp_emissive_hit(Vec contribution, RenderStats* stats, bool primary_hit) {
+    const float lum = luminance(contribution);
+    if (stats) {
+        stats_update_max(&stats->max_emissive_hit_lum_milli, lum);
+        if (primary_hit) {
+            stats_increment(&stats->emissive_hit_primary_count);
+            stats_update_max(&stats->max_emissive_hit_primary_lum_milli, lum);
+        } else {
+            stats_increment(&stats->emissive_hit_indirect_count);
+            stats_update_max(&stats->max_emissive_hit_indirect_lum_milli, lum);
+        }
+    }
+    if (lum > kEmissiveHitLumLimit) {
+        if (stats) {
+            stats_increment(&stats->emissive_hit_clamp_count);
+            if (primary_hit) {
+                stats_increment(&stats->emissive_hit_primary_clamp_count);
+            } else {
+                stats_increment(&stats->emissive_hit_indirect_clamp_count);
+            }
+        }
+        contribution = contribution * (kEmissiveHitLumLimit / lum);
+    }
+    return contribution;
+}
+
+HOST_DEVICE Vec clamp_throughput(Vec throughput, uint32_t* clamp_counter, RenderStats* stats) {
+    const float max_comp = max_component(throughput);
+    if (stats) {
+        stats_update_max(&stats->max_throughput_component_milli, max_comp);
+    }
+    if (max_comp > kThroughputMaxComponent) {
+        if (stats && clamp_counter) {
+            stats_increment(clamp_counter);
+        }
+        throughput = throughput * (kThroughputMaxComponent / max_comp);
+    }
+    return throughput;
+}
+
 /**
  * @brief 路径追踪主算法 (Path Tracing Core)
  * 采用迭代式路径追踪，支持 BVH 遍历、PBR 材质、NEE 显式光源采样和 RR 俄罗斯轮盘赌
  */
-HOST_DEVICE Vec trace(Vec r_o, Vec r_d, Random& rng, const LinearBVHNode* bvh_nodes, const Object* scene_objects, const int* light_indices, int l_count) {
+HOST_DEVICE Vec trace(Vec r_o,
+                      Vec r_d,
+                      Random& rng,
+                      const LinearBVHNode* bvh_nodes,
+                      const Object* scene_objects,
+                      const int* light_indices,
+                      int l_count,
+                      RenderStats* stats) {
     Vec radiance = {0, 0, 0};
     Vec throughput = {1, 1, 1};
     const int MAX_DEPTH = 10;
@@ -118,22 +214,32 @@ HOST_DEVICE Vec trace(Vec r_o, Vec r_d, Random& rng, const LinearBVHNode* bvh_no
         Vec x_hit = r_o + r_d * d_min;
         Vec n = (obj.v1 - obj.v0).cross(obj.v2 - obj.v0).norm();
         Vec nl = n.dot(r_d) < 0 ? n : n * -1; // 修正后的法线方向
+        bool is_emissive = obj.emission.norm_len() > 0.1f;
 
         // [2] 累加自发光 (仅当满足镜面标记或第一帧，防止 NEE 重复计数)
-        if (prev_was_specular) {
-            radiance = radiance + throughput.mult(obj.emission);
+        if (prev_was_specular && is_emissive) {
+            Vec emissive_hit = throughput.mult(obj.emission);
+            emissive_hit = clamp_emissive_hit(emissive_hit, stats, depth == 0);
+            radiance = radiance + emissive_hit;
         }
-        if (obj.emission.norm_len() > 0.1f) break;
+        if (is_emissive) break;
 
         // [3] PBR 材质参数预备
         Vec albedo = obj.albedo;
         float metallic = obj.metallic, roughness = obj.roughness, transmission = obj.transmission;
         float cos_theta = std::abs(r_d.dot(nl));
+        bool is_rough_dielectric = (metallic < 0.1f) && (transmission < 0.01f) && (roughness > 0.5f);
 
         // 计算 Fresnel 项
         Vec f0 = albedo * metallic + Vec{0.04f, 0.04f, 0.04f} * (1.0f - metallic);
         Vec F = fresnel_schlick(cos_theta, f0);
-        float p_spec = (F.x + F.y + F.z) * 0.3333f;
+
+        // 诊断结论：
+        // 纯 Cornell Box 墙面本应近似理想漫反射，但原逻辑里即便是 metallic=0、roughness=1 的墙，
+        // 仍会因为 dielectric Fresnel 获得约 4% 的 specular 分支概率。
+        // 这会让“看不到灯、也没有茶壶”的视角里，依旧存在不少间接命中灯的高能路径。
+        // 为了验证这一点，这里先让“高粗糙非金属非透射材质”退回纯漫反射。
+        float p_spec = is_rough_dielectric ? 0.0f : (F.x + F.y + F.z) * 0.3333f;
 
         float rnd = rng.next_float();
         
@@ -147,6 +253,7 @@ HOST_DEVICE Vec trace(Vec r_o, Vec r_d, Random& rng, const LinearBVHNode* bvh_no
             else r_d = (r_d * nnt - n * ((into ? 1 : -1) * (ddn * nnt + std::sqrt(cos2t)))).norm();
             r_o = x_hit + r_d * 0.001f; 
             throughput = throughput.mult(albedo) * (1.0f / std::max(transmission, 0.01f));
+            throughput = clamp_throughput(throughput, stats ? &stats->throughput_clamp_refract_count : nullptr, stats);
             prev_was_specular = true;
         } 
         else if (rnd < transmission + p_spec || (roughness < 0.03f)) {
@@ -164,6 +271,7 @@ HOST_DEVICE Vec trace(Vec r_o, Vec r_d, Random& rng, const LinearBVHNode* bvh_no
             // 确定性镜面判定：如果足够光滑，执行无损能量传输以消除噪声
             float weight = (roughness < 0.03f) ? 1.0f : std::max(p_spec, 0.01f);
             throughput = throughput.mult(F) * (1.0f / weight);
+            throughput = clamp_throughput(throughput, stats ? &stats->throughput_clamp_specular_count : nullptr, stats);
             prev_was_specular = true;
         } 
         else {
@@ -209,7 +317,10 @@ HOST_DEVICE Vec trace(Vec r_o, Vec r_d, Random& rng, const LinearBVHNode* bvh_no
                         float area = (light.v1 - light.v0).cross(light.v2 - light.v0).norm_len() * 0.5f;
                         float dot_ln = ((light.v1 - light.v0).cross(light.v2 - light.v0).norm()).dot(ld * -1.0f);
                         float cos_l = (dot_ln < 0) ? -dot_ln : dot_ln;
-                        radiance = radiance + throughput.mult(light.emission.mult(albedo)) * (nl.dot(ld) * cos_l * area / (dist_sq * M_PI * (1.0f/l_count)));
+                        Vec direct_light = throughput.mult(light.emission.mult(albedo)) *
+                                           (nl.dot(ld) * cos_l * area / (dist_sq * M_PI * (1.0f/l_count)));
+                        direct_light = clamp_direct_light(direct_light, stats);
+                        radiance = radiance + direct_light;
                     }
                 }
             }
@@ -221,6 +332,7 @@ HOST_DEVICE Vec trace(Vec r_o, Vec r_d, Random& rng, const LinearBVHNode* bvh_no
             r_o = x_hit + nl * 0.001f; 
             float p_diff = std::max(1.0f - transmission - p_spec, 0.01f);
             throughput = throughput.mult(albedo) * (1.0f / p_diff);
+            throughput = clamp_throughput(throughput, stats ? &stats->throughput_clamp_diffuse_count : nullptr, stats);
             prev_was_specular = false; 
         }
 
@@ -230,6 +342,7 @@ HOST_DEVICE Vec trace(Vec r_o, Vec r_d, Random& rng, const LinearBVHNode* bvh_no
             if (p < 0.1f) p = 0.1f;
             if (rng.next_float() > p) break;
             throughput = throughput * (1.0f / p);
+            throughput = clamp_throughput(throughput, stats ? &stats->throughput_clamp_rr_count : nullptr, stats);
         }
     }
     return radiance;
@@ -251,6 +364,11 @@ void init_renderer_sycl() {
     }
 }
 
+queue& get_renderer_queue() {
+    init_renderer_sycl();
+    return *g_queue;
+}
+
 void init_scene_data(const std::vector<Object>& objects, const std::vector<std::string>& texture_files, const std::vector<LinearBVHNode>& nodes, const std::vector<int>& light_indices) {
     init_renderer_sycl();
     if (d_objects) free(d_objects, *g_queue);
@@ -267,7 +385,14 @@ void init_scene_data(const std::vector<Object>& objects, const std::vector<std::
     }
 }
 
-void launch_render_kernel(Vec* accum_buffer_usm, int width, int height, int frame_seed, int tx, int ty, CameraParams cam) {
+void launch_render_kernel(Vec* accum_buffer_usm,
+                          int width,
+                          int height,
+                          int frame_seed,
+                          int tx,
+                          int ty,
+                          CameraParams cam,
+                          RenderStats* stats_usm) {
     auto objects = d_objects; auto nodes = d_bvh_nodes; auto lights = d_light_indices; int l_count = d_light_count;
     g_queue->submit([&](handler& h) {
         h.parallel_for(nd_range<2>(range<2>(width, height), range<2>(tx, ty)), [=](nd_item<2> item) {
@@ -281,15 +406,31 @@ void launch_render_kernel(Vec* accum_buffer_usm, int width, int height, int fram
             float fy = 0.5f - (float)(y + rng.next_float() - 0.5f) / height;
             
             Vec r_d = (cam.cx * fx + cam.cy * fy + cam.dir).norm();
-            Vec color = trace(cam.pos, r_d, rng, nodes, objects, lights, l_count);
+            Vec color = trace(cam.pos, r_d, rng, nodes, objects, lights, l_count, stats_usm);
             
             // --- 数值稳定性防火墙 ---
-            if (std::isnan(color.x) || std::isnan(color.y) || std::isnan(color.z) || std::isinf(color.x) || std::isinf(color.y) || std::isinf(color.z)) color = {0,0,0};
+            if (std::isnan(color.x) || std::isnan(color.y) || std::isnan(color.z) || std::isinf(color.x) || std::isinf(color.y) || std::isinf(color.z)) {
+                if (stats_usm) {
+                    stats_increment(&stats_usm->nan_or_inf_pixels);
+                }
+                color = {0,0,0};
+            }
             color.x = std::max(0.0f, color.x); color.y = std::max(0.0f, color.y); color.z = std::max(0.0f, color.z);
             
-            // Firefly Clamping (严格亮度钳制，治理异常噪点)
-            float lum = color.x * 0.2126f + color.y * 0.7152f + color.z * 0.0722f;
-            if (lum > 5.0f) color = color * (5.0f / lum); 
+            // Firefly Clamping (最终兜底)
+            // 正常运行时这层应保持开启，用于兜住少量仍然漏过前面分项裁剪的异常高亮样本。
+            float lum = luminance(color);
+            if (stats_usm) {
+                stats_update_max(&stats_usm->max_final_color_lum_milli, lum);
+            }
+            if (lum > kFinalFireflyLumLimit) {
+                if (stats_usm) {
+                    stats_increment(&stats_usm->final_firefly_clamp_count);
+                }
+                if (kApplyFinalFireflyClamp) {
+                    color = color * (kFinalFireflyLumLimit / lum);
+                }
+            }
             
             accum_buffer_usm[i] = accum_buffer_usm[i] + color;
         });

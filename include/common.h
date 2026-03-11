@@ -96,15 +96,32 @@ inline float clamp(float x) {
     return x < 0 ? 0 : x > 1 ? 1 : x; 
 }
 
-// [辅助函数] 颜色量化 + Gamma 校正
-// 作用: 将物理线性的浮点亮度 (0.0 - 1.0) 转换为 显示器可用的整数 (0 - 255)。
-// 核心步骤:
-// 1. clamp(x): 保证安全范围。
-// 2. pow(..., 1/2.2): Gamma 校正。
-//    显示器是非线性的，会把画面压暗。我们需要预先将画面"提亮" (指数 0.45)，
-//    这样显示器压暗后，人眼看到的才是正确的物理亮度。
-// 3. * 255 + .5: 映射到 0-255 并四舍五入。
-inline int toInt(float x) { 
-    return int(pow(clamp(x), 1 / 2.2) * 255 + .5); 
+// [辅助函数] Reinhard Tone Mapping
+// 作用: 将 HDR 线性亮度压缩到显示器更容易承载的范围。
+// 为什么需要它？
+// 1. 路径追踪天然会产生大于 1.0 的高动态范围亮度。
+// 2. 如果直接 clamp，再做 Gamma，所有超过 1.0 的值都会被硬裁成纯白，
+//    肉眼看上去就像全屏随机冒出的白点。
+// 3. Reinhard 是最简单稳定的基线：x / (1 + x)。
+inline float tone_map_reinhard(float x) {
+    float safe = x < 0.0f ? 0.0f : x;
+    return safe / (1.0f + safe);
 }
 
+// [辅助函数] 显示编码
+// 作用: 将 HDR 线性亮度转换为显示器使用的 SDR 值。
+// 核心步骤:
+// 1. tone_map_reinhard(x): 压缩动态范围。
+// 2. clamp(x): 保证安全范围。
+// 3. pow(..., 1/2.2): Gamma 校正。
+//    显示器是非线性的，会把画面压暗。我们需要预先将画面"提亮" (指数 0.45)，
+//    这样显示器压暗后，人眼看到的才是正确的物理亮度。
+inline float encode_display_value(float x) {
+    return std::pow(clamp(tone_map_reinhard(x)), 1.0f / 2.2f);
+}
+
+// [辅助函数] 颜色量化
+// 作用: 将经过显示编码的浮点亮度转换为 0 - 255 整数。
+inline int toInt(float x) { 
+    return int(encode_display_value(x) * 255 + .5f); 
+}
