@@ -8,7 +8,7 @@
 - **Lunar Lake 优化**:
   - **USM (Unified Shared Memory)**: 利用 SoC 统一内存特性，实现 CPU/GPU 零拷贝数据传输。
   - **Xe2 矢量优化**: 关键路径使用 `sycl::native` 指令集和 FMA (乘加) 指令。
-  - **SIMD 调度**: 针对 Xe2 Sub-group 16/32 优化的线程组布局 (16x8)。
+  - **SIMD 调度**: 当前主渲染使用针对本机实测调整后的工作组布局 `8x8`。
 - **物理渲染算法**:
   - **BVH 加速结构**: 线性化 BVH 树，支持高速射线求交。
   - **NEE (Next Event Estimation)**: 显式光源采样，大幅降低阴影区域噪点。
@@ -20,7 +20,39 @@
 - **NPU 帧降噪接口**:
   - 基于 OpenVINO C++ Runtime，在程序内直接构建轻量卷积降噪图并编译到 `NPU`。
   - 当前内置模型是一个 `5x5` 高斯残差卷积降噪器，带简单的高亮保护，输入输出均为当前窗口分辨率。
+  - 主程序默认启用异步 NPU 流水线：GPU 持续渲染，NPU 后台处理最近提交的一帧，并显示最近完成的降噪结果。
   - 若未检测到 `NPU` 或 NPU 编译失败，渲染器会自动回退到原始画面，不影响主渲染流程。
+
+## 🧪 已落地的专项优化
+
+当前项目不是“原始 CUDA 示例直接迁移”的状态，而是已经做过几轮面向这台机器的专项优化：
+
+1. **墙面材质分支修正**
+   - 对高粗糙、非金属、非透射材质，直接按纯漫反射处理。
+   - 这样可以避免墙面错误走入低概率 `specular` 路径，显著减少全局高亮离群样本。
+
+2. **BVH 构建质量优化**
+   - BVH 构建已经从简单中位数分裂升级为分桶 `SAH` 划分。
+   - 同时把叶子阈值放宽到小批量三角形，减少树深和栈操作。
+
+3. **三角形几何预计算**
+   - CPU 端预烘焙 `edge1 / edge2 / normal / area`。
+   - GPU kernel 不再反复现算这些静态几何量。
+   - 当前对象布局是 `v0 + edge1 + edge2 + normal + area`，兼顾了性能和显存占用。
+
+4. **路径成本控制**
+   - 当前最大路径深度是 `5`
+   - 俄罗斯轮盘赌从 `depth >= 3` 开始
+   - `NEE` 当前只在 `depth < 3` 的浅层路径上启用
+
+5. **显示链降本**
+   - 关闭降噪时，主循环走“直接从累积缓冲转 ARGB”的快速路径
+   - 静止观察时默认隔帧提交显示，减少 CPU 后处理和 SDL 提交开销
+
+6. **异步 NPU 流水线**
+   - GPU 渲染和 NPU 降噪解耦
+   - 接受一定显示延迟，不在相机移动时强制作废旧帧
+   - 标题栏会显示当前 `Lag`
 
 ## 🛠️ 环境需求
 
@@ -49,6 +81,10 @@
    ```bash
     ./bin/sycl_engine
    ```
+   默认行为:
+   - 启用异步 NPU 降噪流水线
+   - 终端显示 `FPS / Frame / Present / DenoiseLag`
+   - 自动记录 `logs/perf_*.csv` 性能日志
 
 4. **检查 OpenVINO 是否识别到 NPU**:
    ```bash
@@ -68,8 +104,10 @@
 
 1. 程序启动时先用 OpenVINO 查询当前是否存在 `NPU` 设备。
 2. 如果存在，就在内存中构建一个轻量残差卷积降噪图，并编译到 `NPU`。
-3. 每帧先把路径追踪累积结果整理成线性 `RGB`，再送进 NPU 降噪。
-4. 如果没有检测到 `NPU`，或编译 / 推理失败，就直接显示原始画面。
+3. 主线程每次准备显示时，会把最近一帧线性 `RGB` 提交给后台降噪线程。
+4. 后台线程持续处理“最近待处理帧”，并发布“最近完成的降噪结果”。
+5. 显示端不等待 `NPU`，而是直接显示最近完成的一帧，允许一定显示延迟。
+6. 如果没有检测到 `NPU`，或编译 / 推理失败，就直接显示原始画面。
 
 内置模型说明：
 
@@ -82,13 +120,19 @@
 
 ## 🔍 诊断模式
 
-默认运行时不会打印逐帧诊断统计，也不会关闭 NPU 降噪。
-如果后续还需要继续排查 fireflies，可以直接改下面两个代码开关：
+默认运行时不会打印逐帧诊断统计。
+如果后续还需要继续排查 fireflies 或继续做性能实验，可以直接改下面几个代码开关：
 
-- [main.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/main.cpp#L30) 的 `kEnableDiagnosticStats`
-- [main.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/main.cpp#L29) 的 `kEnableNpuDenoiser`
+- [main.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/main.cpp#L41) 的 `kEnableNpuDenoiser`
+- [main.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/main.cpp#L42) 的 `kEnableDiagnosticStats`
+- [main.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/main.cpp#L46) 和 [main.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/main.cpp#L47) 的工作组配置
+- [renderer_sycl.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/renderer_sycl.cpp#L34) 到 [renderer_sycl.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/renderer_sycl.cpp#L36) 的路径深度和 NEE 范围
 
-当前渲染器还保留了分项统计与分层 clamp 的实现，便于后续继续做路径追踪诊断，但默认不会打扰正常使用。
+`perf_*.csv` 当前会记录：
+- `input_ms / render_ms / post_ms / present_ms / denoise_ms / total_ms / fps`
+- `GPU` 两个 GT 的活动频率与估算忙碌率
+- `NPU` 忙碌率、频率和内存占用
+- 在开启诊断统计时，还会记录分项 clamp 计数
 
 ## 🎮 操作快捷键
 
