@@ -28,10 +28,13 @@ LDFLAGS = -lSDL2 -fsycl -qopenmp $(OV_LIBS)
 # 3. 目标文件
 TARGET = $(OBJ_DIR)/sycl_engine
 CHECK_NPU_TARGET = $(OBJ_DIR)/check_npu
+DEMO_TARGET = $(OBJ_DIR)/denoise_demo
 
 # 源文件列表 (移除 renderer.cu 和 pipeline.cpp，因为我们简化了逻辑)
 OBJS_NAMES = bvh.o renderer_sycl.o camera.o scene.o loader.o input.o image_io.o denoiser_openvino.o main.o
 OBJS = $(addprefix $(OBJ_DIR)/, $(OBJS_NAMES))
+DEMO_OBJS_NAMES = bvh.o renderer_sycl.o camera.o scene.o loader.o denoiser_openvino.o denoise_demo.o
+DEMO_OBJS = $(addprefix $(OBJ_DIR)/, $(DEMO_OBJS_NAMES))
 
 # 4. 构建规则
 all: dir $(TARGET)
@@ -43,6 +46,10 @@ $(TARGET): $(OBJS)
 	@echo "🔗 链接主程序: $@"
 	@$(CXX) $(OBJS) -o $@ $(LDFLAGS)
 
+$(DEMO_TARGET): $(DEMO_OBJS)
+	@echo "🔗 链接演示程序: $@"
+	@$(CXX) $(DEMO_OBJS) -o $@ $(LDFLAGS)
+
 # 通用 C++ 编译规则
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp | check-env dir
 	@echo "🔨 编译 $<"
@@ -51,6 +58,13 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp | check-env dir
 run: all
 	@echo "🚀 运行 SYCL 光追引擎..."
 	@./$(TARGET)
+
+denoise-demo: $(DEMO_TARGET)
+	@echo "✅ 演示程序已构建: $(DEMO_TARGET)"
+
+run-denoise-demo: $(DEMO_TARGET)
+	@echo "🧪 运行单帧降噪对比演示..."
+	@./$(DEMO_TARGET)
 
 check-env:
 	@if [ -z "$$ONEAPI_ROOT" ] || ! command -v $(CXX) >/dev/null 2>&1; then \
@@ -77,4 +91,4 @@ clean:
 	@echo "🧹 清理构建产物..."
 	@rm -rf $(OBJ_DIR)
 
-.PHONY: all dir clean run check-env checknpu
+.PHONY: all dir clean run check-env checknpu denoise-demo run-denoise-demo
