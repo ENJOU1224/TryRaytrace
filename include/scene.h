@@ -28,18 +28,22 @@ enum Refl_t {
 // 没有哪怕 1 个字节的 Padding 浪费！带宽利用率 100%。
 // --------------------------------------------------------------------------------------
 struct ALIGN(16) Object {
-    Vec v0, v1, v2; 
-    Vec albedo;   
-    Vec emission; 
+    Vec v0 = {0.0f, 0.0f, 0.0f};
+    Vec v1 = {0.0f, 0.0f, 0.0f};
+    Vec v2 = {0.0f, 0.0f, 0.0f};
+    Vec albedo = {0.0f, 0.0f, 0.0f};
+    Vec emission = {0.0f, 0.0f, 0.0f};
 
-    float metallic;   
-    float roughness;  
-    float ior;        
-    float transmission; 
+    float metallic = 0.0f;
+    float roughness = 1.0f;
+    float ior = 1.45f;
+    float transmission = 0.0f;
 
-    int tex_id; 
+    int tex_id = -1;
     
-    float pad1, pad2, pad3;
+    float pad1 = 0.0f;
+    float pad2 = 0.0f;
+    float pad3 = 0.0f;
 };
 
 // ======================================================================================

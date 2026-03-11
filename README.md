@@ -14,12 +14,12 @@
   - **NEE (Next Event Estimation)**: 显式光源采样，大幅降低阴影区域噪点。
   - **Pro 级 PBR 材质**: 支持金属 (Specular)、玻璃 (Refraction) 和漫反射 (Diffuse)，基于 Schlick 菲涅尔近似。
 - **稳定性工程**:
-  - **Firefly Clamping**: 严格的数值钳制，防止出现高亮异常噪点。
+  - **Firefly Clamping**: 分层处理直接光、命中光源、自发光与最终颜色，避免少量离群样本污染全图。
   - **鲁棒性防火墙**: 内置 NaN/Inf 过滤与负值清理。
   - **实时反馈**: 实时 FPS 统计、终端渲染进度刷新及自动 Snapshot/Log 保存。
 - **NPU 帧降噪接口**:
   - 基于 OpenVINO C++ Runtime，在程序内直接构建轻量卷积降噪图并编译到 `NPU`。
-  - 当前内置模型是一个 `5x5` 高斯残差卷积降噪器，输入输出均为当前窗口分辨率。
+  - 当前内置模型是一个 `5x5` 高斯残差卷积降噪器，带简单的高亮保护，输入输出均为当前窗口分辨率。
   - 若未检测到 `NPU` 或 NPU 编译失败，渲染器会自动回退到原始画面，不影响主渲染流程。
 
 ## 🛠️ 环境需求
@@ -66,12 +66,22 @@
 
 内置模型说明：
 
-- 模型结构是 `input -> 5x5 Gaussian Conv -> residual blend -> output`
-- 残差融合比例固定为 `0.62 * 原图 + 0.38 * 平滑结果`
+- 模型结构是 `input -> 5x5 Gaussian Conv -> 高亮保护 -> 5x5 Gaussian Conv -> residual blend -> output`
+- 残差融合比例固定为 `0.82 * 保护后原图 + 0.18 * 平滑结果`
 - 这个模型不是追求极限画质的 SOTA 网络，而是为了当前项目阶段选择的稳定工程基线：
   - 不依赖外部模型文件
   - 算子非常简单，NPU 兼容性高
   - 代码可直接阅读，适合学习 OpenVINO 图构建与 NPU 部署
+
+## 🔍 诊断模式
+
+默认运行时不会打印逐帧诊断统计，也不会关闭 NPU 降噪。
+如果后续还需要继续排查 fireflies，可以直接改下面两个代码开关：
+
+- [main.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/main.cpp#L30) 的 `kEnableDiagnosticStats`
+- [main.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/main.cpp#L29) 的 `kEnableNpuDenoiser`
+
+当前渲染器还保留了分项统计与分层 clamp 的实现，便于后续继续做路径追踪诊断，但默认不会打扰正常使用。
 
 ## 🎮 操作快捷键
 

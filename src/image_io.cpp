@@ -1,7 +1,7 @@
 #include "image_io.h"
 #include <cstdio>
-#include <cstdlib>
 #include <ctime>
+#include <filesystem>
 #include <iostream>
 #include <vector>
 #include <omp.h> // [性能关键] OpenMP 库
@@ -19,9 +19,13 @@ void save_snapshot(const Vec* h_accum, int w, int h, int frame, float focus_dist
     // ------------------------------------------------------------------
     // 1. 准备环境
     // ------------------------------------------------------------------
-    // 确保输出目录存在 (-p 表示如果存在就不报错，且自动创建父目录)
-    // 这一步开销很小，且只在保存时触发，使用 system 调用最简单通用。
-    (void)system("mkdir -p logs");
+    // 使用标准库创建目录，避免依赖 shell 命令。
+    std::error_code dir_ec;
+    std::filesystem::create_directories("logs", dir_ec);
+    if (dir_ec) {
+        std::cerr << "[IO Error] Failed to create logs directory: " << dir_ec.message() << std::endl;
+        return;
+    }
 
     // ------------------------------------------------------------------
     // 2. 生成文件名 (带时间戳和物理参数)
@@ -35,8 +39,8 @@ void save_snapshot(const Vec* h_accum, int w, int h, int frame, float focus_dist
     char filename[256];
     // [优化] 将焦距(F)和光圈(A)写进文件名，方便后续对比实验结果
     // 例如: logs/2025-12-25_12-00-00_Frame500_F110.0_A0.5.ppm
-    sprintf(filename, "logs/%s_Frame%d_F%.1f_A%.2f.ppm", 
-            time_str, frame, focus_dist, aperture);
+    std::snprintf(filename, sizeof(filename), "logs/%s_Frame%d_F%.1f_A%.2f.ppm",
+                  time_str, frame, focus_dist, aperture);
 
     // ------------------------------------------------------------------
     // 3. 并行数据转换 (CPU Compute Bound)
@@ -78,7 +82,7 @@ void save_snapshot(const Vec* h_accum, int w, int h, int frame, float focus_dist
         
         // --- [新增] 自动保存 Log 文件 ---
         char log_filename[256];
-        sprintf(log_filename, "logs/%s_Frame%d.log", time_str, frame);
+        std::snprintf(log_filename, sizeof(log_filename), "logs/%s_Frame%d.log", time_str, frame);
         FILE* lf = fopen(log_filename, "w");
         if (lf) {
             fprintf(lf, "Render Statistics:\n");

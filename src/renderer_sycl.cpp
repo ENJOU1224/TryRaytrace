@@ -30,6 +30,22 @@ constexpr float kEmissiveHitLumLimit = 4.0f;
 constexpr float kThroughputMaxComponent = 4.0f;
 constexpr float kFinalFireflyLumLimit = 2.0f;
 constexpr bool kApplyFinalFireflyClamp = true;
+constexpr float kRayEpsilon = 0.001f;
+
+struct SceneHit {
+    float t = 1e20f;
+    int object_id = -1;
+};
+
+struct LightSample {
+    Vec direction = {0.0f, 0.0f, 0.0f};
+    float distance = 0.0f;
+    float distance_sq = 0.0f;
+    float area = 0.0f;
+    float light_cos = 0.0f;
+    const Object* light = nullptr;
+    bool valid = false;
+};
 
 /**
  * @brief 高性能 Hash 随机数生成器 (PCG 算法简化版)
@@ -149,6 +165,168 @@ HOST_DEVICE Vec clamp_throughput(Vec throughput, uint32_t* clamp_counter, Render
 }
 
 /**
+ * @brief 射线与单个三角形求交
+ *
+ * 这是 Moller-Trumbore 算法的直接实现，供主射线求交和阴影射线共用。
+ * 抽成小函数有两个好处：
+ * 1. 避免同一段代码在 trace() 和 shadow test 里各写一遍。
+ * 2. 便于后续单独优化或替换成 watertight 版本。
+ */
+HOST_DEVICE bool intersect_triangle(const Vec& ray_origin,
+                                    const Vec& ray_dir,
+                                    const Object& obj,
+                                    float t_min,
+                                    float t_max,
+                                    float& out_t) {
+    Vec e1 = obj.v1 - obj.v0;
+    Vec e2 = obj.v2 - obj.v0;
+    Vec h = ray_dir.cross(e2);
+    float a = e1.dot(h);
+    if (a > -1e-5f && a < 1e-5f) {
+        return false;
+    }
+
+    float f = 1.0f / a;
+    Vec s = ray_origin - obj.v0;
+    float u = f * s.dot(h);
+    if (u < 0.0f || u > 1.0f) {
+        return false;
+    }
+
+    Vec q = s.cross(e1);
+    float v = f * ray_dir.dot(q);
+    if (v < 0.0f || u + v > 1.0f) {
+        return false;
+    }
+
+    float t = f * e2.dot(q);
+    if (t <= t_min || t >= t_max) {
+        return false;
+    }
+
+    out_t = t;
+    return true;
+}
+
+/**
+ * @brief 在 BVH 中查找最近交点
+ */
+HOST_DEVICE SceneHit find_closest_hit(const Vec& ray_origin,
+                                      const Vec& ray_dir,
+                                      const LinearBVHNode* bvh_nodes,
+                                      const Object* scene_objects) {
+    SceneHit hit;
+    int stack[32];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = 0;
+    Vec ray_inv_dir = {1.0f / ray_dir.x, 1.0f / ray_dir.y, 1.0f / ray_dir.z};
+
+    while (stack_ptr > 0) {
+        int idx = stack[--stack_ptr];
+        const auto& node = bvh_nodes[idx];
+        if (!node.bounds.hit(ray_origin, ray_inv_dir, kRayEpsilon, hit.t)) {
+            continue;
+        }
+
+        if (node.is_leaf) {
+            for (int k = 0; k < node.primitive_count; ++k) {
+                int obj_idx = node.primitive_offset + k;
+                float t = hit.t;
+                if (intersect_triangle(ray_origin, ray_dir, scene_objects[obj_idx], kRayEpsilon, hit.t, t)) {
+                    hit.t = t;
+                    hit.object_id = obj_idx;
+                }
+            }
+        } else {
+            stack[stack_ptr++] = node.right_child_idx;
+            stack[stack_ptr++] = node.left_child_idx;
+        }
+    }
+
+    return hit;
+}
+
+/**
+ * @brief 判断从表面点到采样光点的阴影射线是否被遮挡
+ */
+HOST_DEVICE bool is_shadowed(const Vec& shadow_origin,
+                             const Vec& shadow_dir,
+                             float max_distance,
+                             const LinearBVHNode* bvh_nodes,
+                             const Object* scene_objects) {
+    int stack[32];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = 0;
+    Vec inv_dir = {1.0f / shadow_dir.x, 1.0f / shadow_dir.y, 1.0f / shadow_dir.z};
+
+    while (stack_ptr > 0) {
+        int idx = stack[--stack_ptr];
+        if (!bvh_nodes[idx].bounds.hit(shadow_origin, inv_dir, kRayEpsilon, max_distance - 0.01f)) {
+            continue;
+        }
+
+        if (bvh_nodes[idx].is_leaf) {
+            for (int k = 0; k < bvh_nodes[idx].primitive_count; ++k) {
+                int object_id = bvh_nodes[idx].primitive_offset + k;
+                float t = max_distance;
+                if (intersect_triangle(shadow_origin,
+                                       shadow_dir,
+                                       scene_objects[object_id],
+                                       kRayEpsilon,
+                                       max_distance - 0.01f,
+                                       t)) {
+                    return true;
+                }
+            }
+        } else {
+            stack[stack_ptr++] = bvh_nodes[idx].right_child_idx;
+            stack[stack_ptr++] = bvh_nodes[idx].left_child_idx;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * @brief 从一个三角形面光源上采样一点
+ */
+HOST_DEVICE LightSample sample_light(const Object& light, const Vec& hit_point, const Vec& surface_normal, Random& rng) {
+    LightSample sample;
+    float lu = 1.0f - std::sqrt(rng.next_float());
+    float lv = rng.next_float() * (1.0f - lu);
+    Vec light_point = light.v0 * lu + light.v1 * lv + light.v2 * (1.0f - lu - lv);
+    Vec to_light = light_point - hit_point;
+    float distance_sq = std::max(to_light.dot(to_light), 0.01f);
+    float distance = std::sqrt(distance_sq);
+    Vec light_dir = to_light * (1.0f / distance);
+
+    if (surface_normal.dot(light_dir) <= 0.0f) {
+        return sample;
+    }
+
+    Vec light_normal = (light.v1 - light.v0).cross(light.v2 - light.v0);
+    float area = light_normal.norm_len() * 0.5f;
+    if (area <= 0.0f) {
+        return sample;
+    }
+
+    light_normal.norm();
+    float light_cos = light_normal.dot(light_dir * -1.0f);
+    if (light_cos < 0.0f) {
+        light_cos = -light_cos;
+    }
+
+    sample.direction = light_dir;
+    sample.distance = distance;
+    sample.distance_sq = distance_sq;
+    sample.area = area;
+    sample.light_cos = light_cos;
+    sample.light = &light;
+    sample.valid = true;
+    return sample;
+}
+
+/**
  * @brief 路径追踪主算法 (Path Tracing Core)
  * 采用迭代式路径追踪，支持 BVH 遍历、PBR 材质、NEE 显式光源采样和 RR 俄罗斯轮盘赌
  */
@@ -166,52 +344,13 @@ HOST_DEVICE Vec trace(Vec r_o,
     bool prev_was_specular = true; // 默认 true 以捕捉直接入眼的光
 
     for (int depth = 0; depth < MAX_DEPTH; depth++) {
-        // [1] BVH 树遍历：查找场景中最近交点
-        float d_min = 1e20f;
-        int id = -1;
-        int stack[32];
-        int stack_ptr = 0;
-        stack[stack_ptr++] = 0; 
-        
-        Vec r_inv_d = {1.0f/r_d.x, 1.0f/r_d.y, 1.0f/r_d.z};
-
-        while (stack_ptr > 0) {
-            int idx = stack[--stack_ptr];
-            const auto& node = bvh_nodes[idx];
-            
-            // AABB 包围盒求交 (硬件级 Slab Method)
-            if (!node.bounds.hit(r_o, r_inv_d, 0.001f, d_min)) continue;
-            
-            if (node.is_leaf) {
-                for (int k = 0; k < node.primitive_count; k++) {
-                    int obj_idx = node.primitive_offset + k;
-                    // 射线-三角形求交
-                    Vec e1 = scene_objects[obj_idx].v1 - scene_objects[obj_idx].v0;
-                    Vec e2 = scene_objects[obj_idx].v2 - scene_objects[obj_idx].v0;
-                    Vec h = r_d.cross(e2); 
-                    float a = e1.dot(h);
-                    if (a > -1e-5f && a < 1e-5f) continue;
-                    float f = 1.0f / a;
-                    Vec s = r_o - scene_objects[obj_idx].v0;
-                    float u = f * s.dot(h);
-                    if (u < 0.0f || u > 1.0f) continue;
-                    Vec q = s.cross(e1);
-                    float v = f * r_d.dot(q);
-                    if (v < 0.0f || u + v > 1.0f) continue;
-                    float t = f * e2.dot(q);
-                    if (t > 0.001f && t < d_min) { d_min = t; id = obj_idx; }
-                }
-            } else {
-                stack[stack_ptr++] = node.right_child_idx;
-                stack[stack_ptr++] = node.left_child_idx;
-            }
-        }
+        SceneHit hit = find_closest_hit(r_o, r_d, bvh_nodes, scene_objects);
 
         // 光线逸出场景
-        if (id < 0) break;
+        if (hit.object_id < 0) break;
 
-        const Object& obj = scene_objects[id];
-        Vec x_hit = r_o + r_d * d_min;
+        const Object& obj = scene_objects[hit.object_id];
+        Vec x_hit = r_o + r_d * hit.t;
         Vec n = (obj.v1 - obj.v0).cross(obj.v2 - obj.v0).norm();
         Vec nl = n.dot(r_d) < 0 ? n : n * -1; // 修正后的法线方向
         bool is_emissive = obj.emission.norm_len() > 0.1f;
@@ -251,7 +390,7 @@ HOST_DEVICE Vec trace(Vec r_o,
             float ddn = r_d.dot(nl); float cos2t = 1.0f - nnt * nnt * (1.0f - ddn * ddn);
             if (cos2t < 0) r_d = (r_d - n * 2.0f * r_d.dot(n)).norm();
             else r_d = (r_d * nnt - n * ((into ? 1 : -1) * (ddn * nnt + std::sqrt(cos2t)))).norm();
-            r_o = x_hit + r_d * 0.001f; 
+            r_o = x_hit + r_d * kRayEpsilon;
             throughput = throughput.mult(albedo) * (1.0f / std::max(transmission, 0.01f));
             throughput = clamp_throughput(throughput, stats ? &stats->throughput_clamp_refract_count : nullptr, stats);
             prev_was_specular = true;
@@ -267,7 +406,7 @@ HOST_DEVICE Vec trace(Vec r_o,
                 r_d = (r_d + rand_v * roughness).norm();
             }
             if(r_d.dot(nl) < 0) break;
-            r_o = x_hit + nl * 0.001f; 
+            r_o = x_hit + nl * kRayEpsilon;
             // 确定性镜面判定：如果足够光滑，执行无损能量传输以消除噪声
             float weight = (roughness < 0.03f) ? 1.0f : std::max(p_spec, 0.01f);
             throughput = throughput.mult(F) * (1.0f / weight);
@@ -279,49 +418,18 @@ HOST_DEVICE Vec trace(Vec r_o,
             // NEE: 直接采样光源
             if (l_count > 0 && depth < 3) {
                 const Object& light = scene_objects[light_indices[(int)(rng.next_float() * l_count)]];
-                float lu = 1.0f - std::sqrt(rng.next_float());
-                float lv = rng.next_float() * (1.0f - lu);
-                Vec lp = light.v0 * lu + light.v1 * lv + light.v2 * (1.0f - lu - lv);
-                Vec tl = lp - x_hit;
-                float dist_sq = std::max(tl.dot(tl), 0.01f);
-                float dist = std::sqrt(dist_sq);
-                Vec ld = tl * (1.0f / dist);
-
-                if (nl.dot(ld) > 0) {
-                    bool blocked = false; int s_ptr = 0, s_stack[32]; s_stack[s_ptr++] = 0;
-                    Vec s_inv = {1.0f/ld.x, 1.0f/ld.y, 1.0f/ld.z};
-                    while(s_ptr > 0) {
-                        int idx = s_stack[--s_ptr];
-                        if(!bvh_nodes[idx].bounds.hit(x_hit + nl * 0.001f, s_inv, 0.001f, dist - 0.01f)) continue;
-                        if(bvh_nodes[idx].is_leaf) {
-                            for(int k=0; k<bvh_nodes[idx].primitive_count; k++) {
-                                int s_obj_idx = bvh_nodes[idx].primitive_offset+k;
-                                Vec se1 = scene_objects[s_obj_idx].v1 - scene_objects[s_obj_idx].v0;
-                                Vec se2 = scene_objects[s_obj_idx].v2 - scene_objects[s_obj_idx].v0;
-                                Vec sh = ld.cross(se2); float sa = se1.dot(sh);
-                                if (sa > -1e-5f && sa < 1e-5f) continue;
-                                float sf = 1.0f / sa; Vec ss = (x_hit + nl * 0.001f) - scene_objects[s_obj_idx].v0;
-                                float su = sf * ss.dot(sh); if (su < 0.0f || su > 1.0f) continue;
-                                Vec sq = ss.cross(se1); float sv = sf * ld.dot(sq);
-                                if (sv < 0.0f || su + sv > 1.0f) continue;
-                                // 阴影测试只应统计“光源之前”的遮挡物。
-                                // 如果不加上界判断，被采样到的灯三角形本身也可能被误判为遮挡，
-                                // 直接光会大面积失效，路径追踪只能依赖随机命中光源，方差会急剧上升。
-                                float st = sf * se2.dot(sq);
-                                if (st > 0.001f && st < dist - 0.01f) { blocked = true; break; }
-                            }
-                            if(blocked) break;
-                        } else { s_stack[s_ptr++] = bvh_nodes[idx].right_child_idx; s_stack[s_ptr++] = bvh_nodes[idx].left_child_idx; }
-                    }
-                    if (!blocked) {
-                        float area = (light.v1 - light.v0).cross(light.v2 - light.v0).norm_len() * 0.5f;
-                        float dot_ln = ((light.v1 - light.v0).cross(light.v2 - light.v0).norm()).dot(ld * -1.0f);
-                        float cos_l = (dot_ln < 0) ? -dot_ln : dot_ln;
-                        Vec direct_light = throughput.mult(light.emission.mult(albedo)) *
-                                           (nl.dot(ld) * cos_l * area / (dist_sq * M_PI * (1.0f/l_count)));
-                        direct_light = clamp_direct_light(direct_light, stats);
-                        radiance = radiance + direct_light;
-                    }
+                LightSample light_sample = sample_light(light, x_hit, nl, rng);
+                if (light_sample.valid &&
+                    !is_shadowed(x_hit + nl * kRayEpsilon,
+                                 light_sample.direction,
+                                 light_sample.distance,
+                                 bvh_nodes,
+                                 scene_objects)) {
+                    Vec direct_light = throughput.mult(light.emission.mult(albedo)) *
+                                       (nl.dot(light_sample.direction) * light_sample.light_cos * light_sample.area /
+                                        (light_sample.distance_sq * M_PI * (1.0f / l_count)));
+                    direct_light = clamp_direct_light(direct_light, stats);
+                    radiance = radiance + direct_light;
                 }
             }
 
@@ -329,7 +437,7 @@ HOST_DEVICE Vec trace(Vec r_o,
             float r1 = 2 * M_PI * rng.next_float(), r2 = rng.next_float(), r2s = std::sqrt(r2);
             Vec w = nl, basis_u = (((w.x > 0 ? w.x : -w.x) > 0.1f ? Vec{0,1,0} : Vec{1,0,0}).cross(w)).norm(), basis_v = w.cross(basis_u);
             r_d = (basis_u * std::cos(r1) * r2s + basis_v * std::sin(r1) * r2s + w * std::sqrt(std::max(0.0f, 1.0f-r2))).norm();
-            r_o = x_hit + nl * 0.001f; 
+            r_o = x_hit + nl * kRayEpsilon;
             float p_diff = std::max(1.0f - transmission - p_spec, 0.01f);
             throughput = throughput.mult(albedo) * (1.0f / p_diff);
             throughput = clamp_throughput(throughput, stats ? &stats->throughput_clamp_diffuse_count : nullptr, stats);
@@ -371,6 +479,7 @@ queue& get_renderer_queue() {
 
 void init_scene_data(const std::vector<Object>& objects, const std::vector<std::string>& texture_files, const std::vector<LinearBVHNode>& nodes, const std::vector<int>& light_indices) {
     init_renderer_sycl();
+    (void)texture_files;
     if (d_objects) free(d_objects, *g_queue);
     d_objects = malloc_shared<Object>(objects.size(), *g_queue);
     std::memcpy(d_objects, objects.data(), objects.size() * sizeof(Object));

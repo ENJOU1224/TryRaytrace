@@ -14,14 +14,29 @@ inline float radians(float deg) {
     return deg * (M_PI / 180.0f); 
 }
 
+inline float degrees(float rad) {
+    return rad * (180.0f / M_PI);
+}
+
 // ======================================================================================
 // 构造函数
 // ======================================================================================
 CameraController::CameraController(Vec position, Vec look_at) 
     : pos(position) {
-    // 这里的 look_at 参数在目前的第一人称漫游模式下暂未使用。
-    // 我们默认通过 yaw/pitch = -90/0 来初始化朝向 (看向 -Z)。
-    // 如果需要"看向特定点"的功能，需要在这里用 atan2 计算初始 yaw/pitch。
+    // 兼容两种输入方式：
+    // 1. look_at 是单位方向向量，例如 {0, 0, -1}
+    // 2. look_at 是世界空间中的目标点
+    Vec initial_dir = look_at;
+    const float look_at_len = look_at.norm_len();
+    if (std::abs(look_at_len - 1.0f) > 1e-3f) {
+        initial_dir = look_at - position;
+    }
+
+    if (initial_dir.norm_len() > 1e-6f) {
+        initial_dir.norm();
+        yaw = degrees(std::atan2(initial_dir.z, initial_dir.x));
+        pitch = degrees(std::asin(std::clamp(initial_dir.y, -1.0f, 1.0f)));
+    }
     
     // 初始化相机的局部坐标系 (Front, Right, Up)
     update_camera_vectors();

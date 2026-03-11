@@ -3,6 +3,7 @@
 #include <vector>
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <SDL2/SDL.h>
 #include <sycl/sycl.hpp>
 
@@ -35,6 +36,7 @@ namespace {
 // 2. 诊断统计默认关闭，避免终端刷屏，也避免内核里频繁原子操作带来的额外开销。
 constexpr bool kEnableNpuDenoiser = true;
 constexpr bool kEnableDiagnosticStats = false;
+constexpr int kProgressPrintInterval = 5;
 
 float milli_to_float(uint32_t milli_value) {
     return static_cast<float>(milli_value) / 1000.0f;
@@ -155,7 +157,7 @@ int main(int argc, char** argv) {
     }
     
     // CPU 侧像素映射缓冲区 (用于 SDL 显示)
-    uint32_t* pixel_buffer = (uint32_t*)malloc(w * h * sizeof(uint32_t));
+    std::vector<uint32_t> pixel_buffer(w * h, 0);
     std::vector<float> linear_rgb_frame(w * h * 3, 0.0f);
     std::vector<float> blended_rgb_frame(w * h * 3, 0.0f);
 
@@ -232,10 +234,10 @@ int main(int argc, char** argv) {
                 active_rgb = blended_rgb_frame.data();
             }
         }
-        linear_rgb_to_argb8888(active_rgb, w * h, pixel_buffer);
+        linear_rgb_to_argb8888(active_rgb, w * h, pixel_buffer.data());
 
         // [D] 更新 SDL 屏幕
-        SDL_UpdateTexture(texture, NULL, pixel_buffer, w * sizeof(uint32_t));
+        SDL_UpdateTexture(texture, NULL, pixel_buffer.data(), w * sizeof(uint32_t));
         SDL_RenderClear(renderer);
         SDL_RenderCopy(renderer, texture, NULL, NULL);
         SDL_RenderPresent(renderer);
@@ -246,7 +248,7 @@ int main(int argc, char** argv) {
         last_time = current_time;
         fps = 0.9f * fps + 0.1f * (1.0f / delta.count()); 
 
-        if (gpu_frame % 5 == 0) {
+        if (gpu_frame % kProgressPrintInterval == 0) {
             char title[256];
             sprintf(title, "[%s] FPS: %.1f | Frame: %d | Denoise: %s",
                     q.get_device().get_info<sycl::info::device::name>().c_str(),
@@ -277,6 +279,9 @@ int main(int argc, char** argv) {
                        milli_to_float(render_stats->max_throughput_component_milli),
                        milli_to_float(render_stats->max_final_color_lum_milli));
                 fflush(stdout);
+            } else {
+                printf("\r>> [SYCL] Frame %d | FPS: %.1f", gpu_frame, fps);
+                fflush(stdout);
             }
         }
         gpu_frame++;
@@ -290,7 +295,6 @@ int main(int argc, char** argv) {
     if (render_stats) {
         sycl::free(render_stats, q);
     }
-    free(pixel_buffer);
     SDL_DestroyTexture(texture); 
     SDL_DestroyRenderer(renderer); 
     SDL_DestroyWindow(window); 
