@@ -81,15 +81,13 @@ void load_obj(const char* filename, std::vector<Object>& objects,
 
                 // [构建三角形对象]
                 // 使用 C++20 指定初始化器，清晰明了
-                objects.push_back({
-                    .v0 = v0, 
-                    .v1 = v1, 
-                    .v2 = v2,
-                    .albedo = albedo,
-                    .metallic = metallic,
-                    .roughness = roughness,
-                    .tex_id = -1, // 暂不支持模型纹理
-                });
+                objects.push_back(make_object(v0,
+                                              v1,
+                                              v2,
+                                              albedo,
+                                              {0.0f, 0.0f, 0.0f},
+                                              metallic,
+                                              roughness));
             }
         }
     }

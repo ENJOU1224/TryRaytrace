@@ -2,12 +2,8 @@
 #include "loader.h" 
 
 void add_quad(Scene& scene, Vec p0, Vec p1, Vec p2, Vec p3, Vec color, Vec emission, float metallic, float roughness) {
-    scene.objects.push_back({
-        .v0=p0, .v1=p1, .v2=p2, .albedo=color, .emission=emission, .metallic=metallic, .roughness=roughness, .ior=1.45f, .transmission=0.0f, .tex_id=-1
-    });
-    scene.objects.push_back({
-        .v0=p0, .v1=p2, .v2=p3, .albedo=color, .emission=emission, .metallic=metallic, .roughness=roughness, .ior=1.45f, .transmission=0.0f, .tex_id=-1
-    });
+    scene.objects.push_back(make_object(p0, p1, p2, color, emission, metallic, roughness));
+    scene.objects.push_back(make_object(p0, p2, p3, color, emission, metallic, roughness));
 }
 
 Scene create_cornell_box() {
@@ -25,19 +21,19 @@ Scene create_cornell_box() {
     float wall_r = 1.0f;
 
     // 1. 地板
-    scene.objects.push_back({.v0={-50,0,0}, .v1={50,0,600}, .v2={150,0,0}, .albedo=white, .emission=black, .metallic=wall_m, .roughness=wall_r, .ior=1.45f, .transmission=0.0f, .tex_id=-1});
+    scene.objects.push_back(make_object({-50,0,0}, {50,0,600}, {150,0,0}, white, black, wall_m, wall_r));
     // 2. 天花板
-    scene.objects.push_back({.v0={-50,100,0}, .v1={150,100,0}, .v2={50,100,600}, .albedo=white, .emission=black, .metallic=wall_m, .roughness=wall_r, .ior=1.45f, .transmission=0.0f, .tex_id=-1});
+    scene.objects.push_back(make_object({-50,100,0}, {150,100,0}, {50,100,600}, white, black, wall_m, wall_r));
     // 3. 后墙 (远端)
-    scene.objects.push_back({.v0={-50,0,0}, .v1={150,0,0}, .v2={50,200,0}, .albedo=white, .emission=black, .metallic=wall_m, .roughness=wall_r, .ior=1.45f, .transmission=0.0f, .tex_id=0});
+    scene.objects.push_back(make_object({-50,0,0}, {150,0,0}, {50,200,0}, white, black, wall_m, wall_r, 1.45f, 0.0f, 0));
     // 4. 前墙 (近端，防止漏光)
-    scene.objects.push_back({.v0={-50,0,300}, .v1={150,0,300}, .v2={50,200,300}, .albedo=white, .emission=black, .metallic=wall_m, .roughness=wall_r, .ior=1.45f, .transmission=0.0f, .tex_id=-1});
+    scene.objects.push_back(make_object({-50,0,300}, {150,0,300}, {50,200,300}, white, black, wall_m, wall_r));
     // 5. 左墙
-    scene.objects.push_back({.v0={0,0,-50}, .v1={0,200,50}, .v2={0,0,550}, .albedo=red, .emission=black, .metallic=wall_m, .roughness=wall_r, .ior=1.45f, .transmission=0.0f, .tex_id=-1});
+    scene.objects.push_back(make_object({0,0,-50}, {0,200,50}, {0,0,550}, red, black, wall_m, wall_r));
     // 6. 右墙
-    scene.objects.push_back({.v0={100,0,550}, .v1={100,200,50}, .v2={100,0,-50}, .albedo=green, .emission=black, .metallic=wall_m, .roughness=wall_r, .ior=1.45f, .transmission=0.0f, .tex_id=-1});
+    scene.objects.push_back(make_object({100,0,550}, {100,200,50}, {100,0,-50}, green, black, wall_m, wall_r));
     // 7. 灯
-    scene.objects.push_back({.v0={30,99.9,30}, .v1={70,99.9,30}, .v2={50,99.9,50}, .albedo=black, .emission=light_color, .metallic=wall_m, .roughness=wall_r, .ior=1.45f, .transmission=0.0f, .tex_id=-1});
+    scene.objects.push_back(make_object({30,99.9,30}, {70,99.9,30}, {50,99.9,50}, black, light_color, wall_m, wall_r));
 
     // 茶壶模型：
     // 现在把茶壶加回来，但保留“粗糙非金属墙面纯漫反射”那条修正。
@@ -51,7 +47,9 @@ Scene create_cornell_box() {
     printf("[Scene] Scene created with %lu objects.\n", scene.objects.size());
     scene.world_bound = AABB::empty();
     for (const auto& obj : scene.objects) {
-      scene.world_bound.grow(obj.v0); scene.world_bound.grow(obj.v1); scene.world_bound.grow(obj.v2);
+      scene.world_bound.grow(obj.v0);
+      scene.world_bound.grow(obj.v0 + obj.edge1);
+      scene.world_bound.grow(obj.v0 + obj.edge2);
     }
     scene.world_bound.min = scene.world_bound.min - make_vec(0.1f, 0.1f, 0.1f);
     scene.world_bound.max = scene.world_bound.max + make_vec(0.1f, 0.1f, 0.1f);

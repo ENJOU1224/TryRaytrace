@@ -17,20 +17,19 @@ enum Refl_t {
 };
 
 // ======================================================================================
-// 2. 物体结构体 (Object) - 极致内存布局优化
+// 2. 物体结构体 (Object) - 几何预计算版
 // ======================================================================================
-// [优化策略]: 显存对齐 (Memory Alignment)
-// GPU 读取显存的最佳粒度是 128位 (16字节)。
-// 我们将所有 16字节对齐的 Vec 放在前面，将所有 4字节的标量 (float/int/enum) 放在最后凑整。
-// 
-// 这样排列后，Object 的大小正好是: 
-// 16*6 (Vec) + 4*4 (Scalar) = 112 字节。
-// 没有哪怕 1 个字节的 Padding 浪费！带宽利用率 100%。
+// [优化策略]
+// 1. 继续保持 16 字节对齐，让 GPU 读取 Vec 时更稳定。
+// 2. 将三角形的静态几何量 (edge1 / edge2 / normal / area) 预烘焙到对象里，
+//    避免每次光线求交、阴影测试、灯采样都重复计算。
+// 3. 这会增加一些显存占用，但对当前路径追踪器来说，减少 kernel 内重复算术更划算。
 // --------------------------------------------------------------------------------------
 struct ALIGN(16) Object {
     Vec v0 = {0.0f, 0.0f, 0.0f};
-    Vec v1 = {0.0f, 0.0f, 0.0f};
-    Vec v2 = {0.0f, 0.0f, 0.0f};
+    Vec edge1 = {0.0f, 0.0f, 0.0f};
+    Vec edge2 = {0.0f, 0.0f, 0.0f};
+    Vec normal = {0.0f, 0.0f, 0.0f};
     Vec albedo = {0.0f, 0.0f, 0.0f};
     Vec emission = {0.0f, 0.0f, 0.0f};
 
@@ -38,13 +37,59 @@ struct ALIGN(16) Object {
     float roughness = 1.0f;
     float ior = 1.45f;
     float transmission = 0.0f;
+    float area = 0.0f;
 
     int tex_id = -1;
     
     float pad1 = 0.0f;
     float pad2 = 0.0f;
-    float pad3 = 0.0f;
 };
+
+/**
+ * @brief 预计算三角形静态几何量
+ *
+ * 这些量只依赖顶点位置，不依赖相机或随机数。
+ * 因此把它们前移到 CPU 端烘焙，能减少 GPU kernel 中的大量重复计算。
+ */
+inline void bake_object_geometry(Object& obj) {
+    Vec geometric_normal = obj.edge1.cross(obj.edge2);
+    const float double_area = geometric_normal.norm_len();
+    obj.area = 0.5f * double_area;
+
+    if (double_area > 1e-12f) {
+        obj.normal = geometric_normal * (1.0f / double_area);
+    } else {
+        obj.normal = {0.0f, 0.0f, 0.0f};
+    }
+}
+
+/**
+ * @brief 创建一个带预计算几何量的三角形对象
+ */
+inline Object make_object(Vec v0,
+                          Vec v1,
+                          Vec v2,
+                          Vec albedo,
+                          Vec emission,
+                          float metallic,
+                          float roughness,
+                          float ior = 1.45f,
+                          float transmission = 0.0f,
+                          int tex_id = -1) {
+    Object obj;
+    obj.v0 = v0;
+    obj.edge1 = v1 - v0;
+    obj.edge2 = v2 - v0;
+    obj.albedo = albedo;
+    obj.emission = emission;
+    obj.metallic = metallic;
+    obj.roughness = roughness;
+    obj.ior = ior;
+    obj.transmission = transmission;
+    obj.tex_id = tex_id;
+    bake_object_geometry(obj);
+    return obj;
+}
 
 // ======================================================================================
 // 3. 全局配置与相机

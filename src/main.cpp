@@ -54,6 +54,10 @@ struct StartupPerf {
     double bvh_build_ms = 0.0;
     double upload_ms = 0.0;
     double denoiser_init_ms = 0.0;
+    int display_width = 0;
+    int display_height = 0;
+    int render_width = 0;
+    int render_height = 0;
 };
 
 struct DeviceMetrics {
@@ -193,10 +197,13 @@ public:
         std::fprintf(file_, "# bvh_build_ms=%.3f\n", startup.bvh_build_ms);
         std::fprintf(file_, "# upload_ms=%.3f\n", startup.upload_ms);
         std::fprintf(file_, "# denoiser_init_ms=%.3f\n", startup.denoiser_init_ms);
+        std::fprintf(file_, "# display_resolution=%dx%d\n", startup.display_width, startup.display_height);
+        std::fprintf(file_, "# render_resolution=%dx%d\n", startup.render_width, startup.render_height);
         std::fprintf(file_,
                      "frame,presented,camera_moved,save_request,input_ms,render_ms,post_ms,present_ms,denoise_ms,total_ms,fps,"
                      "gt0_act_freq_mhz,gt1_act_freq_mhz,gt0_idle_delta_ms,gt1_idle_delta_ms,gt0_busy_pct,gt1_busy_pct,"
-                     "npu_busy_pct,npu_freq_mhz,npu_mem_bytes\n");
+                     "npu_busy_pct,npu_freq_mhz,npu_mem_bytes,"
+                     "dl_clamp,eh_clamp,eh_primary_clamp,eh_indirect_clamp,tp_diffuse,tp_specular,tp_refract,tp_rr,final_firefly_clamp,nan_or_inf\n");
         std::fflush(file_);
 
         std::cout << "[Perf] Logging frame timings to " << path_ << std::endl;
@@ -220,13 +227,21 @@ public:
                    double denoise_ms,
                    double total_ms,
                    double fps,
-                   const DeviceMetrics& device_metrics) {
+                   const DeviceMetrics& device_metrics,
+                   const RenderStats* render_stats) {
         if (!file_) {
             return;
         }
 
+        auto stat_or_neg1 = [render_stats](uint32_t RenderStats::*member) -> int {
+            if (!render_stats) {
+                return -1;
+            }
+            return static_cast<int>(render_stats->*member);
+        };
+
         std::fprintf(file_,
-                     "%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,%.3f,%.3f,%.2f,%.2f,%.2f,%.1f,%.0f\n",
+                     "%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,%.3f,%.3f,%.2f,%.2f,%.2f,%.1f,%.0f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
                      frame_index,
                      presented ? 1 : 0,
                      camera_moved ? 1 : 0,
@@ -246,7 +261,17 @@ public:
                      device_metrics.gt1_busy_pct,
                      device_metrics.npu_busy_pct,
                      device_metrics.npu_freq_mhz,
-                     device_metrics.npu_mem_bytes);
+                     device_metrics.npu_mem_bytes,
+                     stat_or_neg1(&RenderStats::direct_light_clamp_count),
+                     stat_or_neg1(&RenderStats::emissive_hit_clamp_count),
+                     stat_or_neg1(&RenderStats::emissive_hit_primary_clamp_count),
+                     stat_or_neg1(&RenderStats::emissive_hit_indirect_clamp_count),
+                     stat_or_neg1(&RenderStats::throughput_clamp_diffuse_count),
+                     stat_or_neg1(&RenderStats::throughput_clamp_specular_count),
+                     stat_or_neg1(&RenderStats::throughput_clamp_refract_count),
+                     stat_or_neg1(&RenderStats::throughput_clamp_rr_count),
+                     stat_or_neg1(&RenderStats::final_firefly_clamp_count),
+                     stat_or_neg1(&RenderStats::nan_or_inf_pixels));
 
         ++pending_rows_;
         if (pending_rows_ >= kPerfFlushInterval) {
@@ -350,8 +375,14 @@ int main(int argc, char** argv) {
     StartupPerf startup_perf;
 
     // 1. 系统参数配置
-    const int w = 1200;
-    const int h = 800;  
+    const int display_w = 1200;
+    const int display_h = 800;
+    const int render_w = display_w;
+    const int render_h = display_h;
+    startup_perf.display_width = display_w;
+    startup_perf.display_height = display_h;
+    startup_perf.render_width = render_w;
+    startup_perf.render_height = render_h;
     
     // 初始化 SDL2 视频子系统
     auto sdl_begin = Clock::now();
@@ -363,10 +394,10 @@ int main(int argc, char** argv) {
     // 创建图形窗口与渲染上下文
     SDL_Window* window = SDL_CreateWindow("Lunar-Raytrace (oneAPI/SYCL)", 
                                           SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 
-                                          w, h, SDL_WINDOW_SHOWN);
+                                          display_w, display_h, SDL_WINDOW_SHOWN);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, 
-                                             SDL_TEXTUREACCESS_STREAMING, w, h);
+                                             SDL_TEXTUREACCESS_STREAMING, render_w, render_h);
     startup_perf.sdl_setup_ms = elapsed_ms(sdl_begin, Clock::now());
 
     // 2. 场景与渲染引擎初始化
@@ -402,8 +433,8 @@ int main(int argc, char** argv) {
     sycl::queue& q = get_renderer_queue();
 
     // 分配 USM Shared Memory：CPU 与 GPU 物理共享，零拷贝访问
-    Vec* d_accum = sycl::malloc_shared<Vec>(w * h, q);
-    std::memset(d_accum, 0, w * h * sizeof(Vec));
+    Vec* d_accum = sycl::malloc_shared<Vec>(render_w * render_h, q);
+    std::memset(d_accum, 0, static_cast<size_t>(render_w) * render_h * sizeof(Vec));
     RenderStats* render_stats = nullptr;
     if (kEnableDiagnosticStats) {
         render_stats = sycl::malloc_shared<RenderStats>(1, q);
@@ -411,19 +442,19 @@ int main(int argc, char** argv) {
     }
     
     // CPU 侧像素映射缓冲区 (用于 SDL 显示)
-    std::vector<uint32_t> pixel_buffer(w * h, 0);
+    std::vector<uint32_t> pixel_buffer(render_w * render_h, 0);
     std::vector<float> linear_rgb_frame;
     std::vector<float> blended_rgb_frame;
     if (kEnableNpuDenoiser) {
-        linear_rgb_frame.resize(static_cast<size_t>(w) * h * 3, 0.0f);
-        blended_rgb_frame.resize(static_cast<size_t>(w) * h * 3, 0.0f);
+        linear_rgb_frame.resize(static_cast<size_t>(render_w) * render_h * 3, 0.0f);
+        blended_rgb_frame.resize(static_cast<size_t>(render_w) * render_h * 3, 0.0f);
     }
 
     FrameDenoiser denoiser;
     std::string last_denoiser_status;
     auto denoiser_begin = Clock::now();
     if (kEnableNpuDenoiser) {
-        denoiser.initialize(w, h);
+        denoiser.initialize(render_w, render_h);
         last_denoiser_status = denoiser.status();
     } else {
         last_denoiser_status = "[系统] 当前已关闭 NPU 降噪。";
@@ -457,27 +488,27 @@ int main(int argc, char** argv) {
         
         // 保存当前快照
         if (state.save_request) {
-            save_snapshot(d_accum, w, h, gpu_frame, cam.get_focus_dist(), cam.get_aperture()); 
+            save_snapshot(d_accum, render_w, render_h, gpu_frame, cam.get_focus_dist(), cam.get_aperture());
         }
         if (state.quit) quit = true;
 
         // 相机移动时重置累加器，确保画面不产生拖影
         if (state.camera_moved) {
             gpu_frame = 1;
-            std::memset(d_accum, 0, w * h * sizeof(Vec));
+            std::memset(d_accum, 0, static_cast<size_t>(render_w) * render_h * sizeof(Vec));
             if (kEnableNpuDenoiser) {
                 denoiser.reset();
             }
         }
 
         // [B] 发射渲染内核
-        CameraParams cam_params = cam.get_params(w, h);
+        CameraParams cam_params = cam.get_params(render_w, render_h);
         // 建议 tx=16, ty=8 以匹配 Intel Xe2 硬件 Sub-group 布局
         if (render_stats) {
             *render_stats = {};
         }
         auto render_begin = Clock::now();
-        launch_render_kernel(d_accum, w, h, gpu_frame, kRenderTileWidth, kRenderTileHeight, cam_params, render_stats);
+        launch_render_kernel(d_accum, render_w, render_h, gpu_frame, kRenderTileWidth, kRenderTileHeight, cam_params, render_stats);
         auto render_end = Clock::now();
         
         // [C] 图像后处理与屏幕提交
@@ -493,11 +524,11 @@ int main(int argc, char** argv) {
         if (should_present) {
             auto post_begin = Clock::now();
             if (kEnableNpuDenoiser) {
-                build_linear_rgb_frame(d_accum, w * h, gpu_frame, linear_rgb_frame);
+                build_linear_rgb_frame(d_accum, render_w * render_h, gpu_frame, linear_rgb_frame);
 
                 if (denoiser.should_run(gpu_frame)) {
                     auto denoise_begin_frame = Clock::now();
-                    bool denoise_ok = denoiser.run(linear_rgb_frame.data(), w, h);
+                    bool denoise_ok = denoiser.run(linear_rgb_frame.data(), render_w, render_h);
                     denoise_ms = elapsed_ms(denoise_begin_frame, Clock::now());
                     if (!denoise_ok) {
                         if (denoiser.status() != last_denoiser_status) {
@@ -514,21 +545,21 @@ int main(int argc, char** argv) {
                         blend_linear_rgb(linear_rgb_frame.data(),
                                          denoiser.output_rgb().data(),
                                          alpha,
-                                         w * h,
+                                         render_w * render_h,
                                          blended_rgb_frame);
                         active_rgb = blended_rgb_frame.data();
                     }
                 }
-                linear_rgb_to_argb8888(active_rgb, w * h, pixel_buffer.data());
+                linear_rgb_to_argb8888(active_rgb, render_w * render_h, pixel_buffer.data());
             } else {
-                accum_to_argb8888(d_accum, w * h, gpu_frame, pixel_buffer.data());
+                accum_to_argb8888(d_accum, render_w * render_h, gpu_frame, pixel_buffer.data());
             }
             auto post_end = Clock::now();
             post_ms = elapsed_ms(post_begin, post_end);
 
             // [D] 更新 SDL 屏幕
             auto present_begin = Clock::now();
-            SDL_UpdateTexture(texture, NULL, pixel_buffer.data(), w * sizeof(uint32_t));
+            SDL_UpdateTexture(texture, NULL, pixel_buffer.data(), render_w * sizeof(uint32_t));
             SDL_RenderClear(renderer);
             SDL_RenderCopy(renderer, texture, NULL, NULL);
             SDL_RenderPresent(renderer);
@@ -557,7 +588,8 @@ int main(int argc, char** argv) {
                               denoise_ms,
                               total_frame_ms,
                               fps,
-                              device_metrics);
+                              device_metrics,
+                              render_stats);
 
         if (gpu_frame % kProgressPrintInterval == 0) {
             char title[256];
@@ -599,7 +631,7 @@ int main(int argc, char** argv) {
     }
 
     // 退出前自动存档
-    save_snapshot(d_accum, w, h, gpu_frame, cam.get_focus_dist(), cam.get_aperture()); 
+    save_snapshot(d_accum, render_w, render_h, gpu_frame, cam.get_focus_dist(), cam.get_aperture());
 
     // 5. 资源清理
     sycl::free(d_accum, q); 

@@ -19,7 +19,7 @@ OV_LIBS = -L$(OV_ROOT)/runtime/lib/intel64 -Wl,-rpath,$(OV_ROOT)/runtime/lib/int
 # -march=native: 针对 Lunar Lake 架构优化
 # -qopenmp: 支持主循环中的图像后处理并行
 CXXFLAGS = -O3 -fsycl -march=native -qopenmp \
-           -I$(SRC_DIR) -I$(INC_DIR) $(OV_INCLUDE) -Wall -Wextra \
+           -I$(SRC_DIR) -I$(INC_DIR) $(OV_INCLUDE) -Wall -Wextra -MMD -MP \
            -D_REENTRANT
 
 # 链接选项
@@ -92,3 +92,5 @@ clean:
 	@rm -rf $(OBJ_DIR)
 
 .PHONY: all dir clean run check-env checknpu denoise-demo run-denoise-demo
+
+-include $(OBJS:.o=.d) $(DEMO_OBJS:.o=.d)

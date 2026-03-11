@@ -33,7 +33,7 @@ constexpr bool kApplyFinalFireflyClamp = true;
 constexpr float kRayEpsilon = 0.001f;
 constexpr int kMaxPathDepth = 5;
 constexpr int kRussianRouletteStartDepth = 3;
-constexpr int kMaxNeeDepth = 2;
+constexpr int kMaxNeeDepth = 3;
 
 struct SceneHit {
     float t = 1e20f;
@@ -186,10 +186,8 @@ HOST_DEVICE bool intersect_triangle(const Vec& ray_origin,
                                     float t_min,
                                     float t_max,
                                     float& out_t) {
-    Vec e1 = obj.v1 - obj.v0;
-    Vec e2 = obj.v2 - obj.v0;
-    Vec h = ray_dir.cross(e2);
-    float a = e1.dot(h);
+    Vec h = ray_dir.cross(obj.edge2);
+    float a = obj.edge1.dot(h);
     if (a > -1e-5f && a < 1e-5f) {
         return false;
     }
@@ -201,13 +199,13 @@ HOST_DEVICE bool intersect_triangle(const Vec& ray_origin,
         return false;
     }
 
-    Vec q = s.cross(e1);
+    Vec q = s.cross(obj.edge1);
     float v = f * ray_dir.dot(q);
     if (v < 0.0f || u + v > 1.0f) {
         return false;
     }
 
-    float t = f * e2.dot(q);
+    float t = f * obj.edge2.dot(q);
     if (t <= t_min || t >= t_max) {
         return false;
     }
@@ -302,7 +300,9 @@ HOST_DEVICE LightSample sample_light(const Object& light, const Vec& hit_point, 
     LightSample sample;
     float lu = 1.0f - std::sqrt(rng.next_float());
     float lv = rng.next_float() * (1.0f - lu);
-    Vec light_point = light.v0 * lu + light.v1 * lv + light.v2 * (1.0f - lu - lv);
+    Vec light_v1 = light.v0 + light.edge1;
+    Vec light_v2 = light.v0 + light.edge2;
+    Vec light_point = light.v0 * lu + light_v1 * lv + light_v2 * (1.0f - lu - lv);
     Vec to_light = light_point - hit_point;
     float distance_sq = std::max(to_light.dot(to_light), 0.01f);
     float distance = std::sqrt(distance_sq);
@@ -312,14 +312,11 @@ HOST_DEVICE LightSample sample_light(const Object& light, const Vec& hit_point, 
         return sample;
     }
 
-    Vec light_normal = (light.v1 - light.v0).cross(light.v2 - light.v0);
-    float area = light_normal.norm_len() * 0.5f;
-    if (area <= 0.0f) {
+    if (light.area <= 0.0f) {
         return sample;
     }
 
-    light_normal.norm();
-    float light_cos = light_normal.dot(light_dir * -1.0f);
+    float light_cos = light.normal.dot(light_dir * -1.0f);
     if (light_cos < 0.0f) {
         light_cos = -light_cos;
     }
@@ -327,7 +324,7 @@ HOST_DEVICE LightSample sample_light(const Object& light, const Vec& hit_point, 
     sample.direction = light_dir;
     sample.distance = distance;
     sample.distance_sq = distance_sq;
-    sample.area = area;
+    sample.area = light.area;
     sample.light_cos = light_cos;
     sample.light = &light;
     sample.valid = true;
@@ -359,7 +356,7 @@ HOST_DEVICE Vec trace(Vec r_o,
 
         const Object& obj = scene_objects[hit.object_id];
         Vec x_hit = r_o + r_d * hit.t;
-        Vec n = (obj.v1 - obj.v0).cross(obj.v2 - obj.v0).norm();
+        Vec n = obj.normal;
         Vec nl = n.dot(r_d) < 0 ? n : n * -1; // 修正后的法线方向
         bool is_emissive = obj.emission.norm_len() > 0.1f;
 
