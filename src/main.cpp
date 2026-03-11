@@ -32,9 +32,9 @@ void signal_handler(int signal) { if (signal == SIGINT) quit = true; }
 namespace {
 
 // 默认运行策略：
-// 1. 正常使用时开启 NPU 降噪。
+// 1. 基础性能优先，默认关闭 NPU 降噪。
 // 2. 诊断统计默认关闭，避免终端刷屏，也避免内核里频繁原子操作带来的额外开销。
-constexpr bool kEnableNpuDenoiser = true;
+constexpr bool kEnableNpuDenoiser = false;
 constexpr bool kEnableDiagnosticStats = false;
 constexpr int kProgressPrintInterval = 5;
 
@@ -70,6 +70,27 @@ void linear_rgb_to_argb8888(const float* rgb_buffer, int pixel_count, uint32_t* 
         const float g = encode_display_value(rgb_buffer[i * 3 + 1]);
         const float b = encode_display_value(rgb_buffer[i * 3 + 2]);
         pixel_buffer[i] = (255 << 24) |
+                          (static_cast<uint32_t>(r * 255.0f + 0.5f) << 16) |
+                          (static_cast<uint32_t>(g * 255.0f + 0.5f) << 8) |
+                          static_cast<uint32_t>(b * 255.0f + 0.5f);
+    }
+}
+
+/**
+ * 纯渲染模式下的快速显示路径。
+ *
+ * 当 NPU 降噪关闭时，没有必要先把整帧写入线性 RGB 缓冲区，再做第二次遍历转成 ARGB。
+ * 这里直接从累积缓冲区完成“平均化 -> Tone Mapping -> Gamma -> 打包显示”，
+ * 可以少一次完整的 CPU 内存遍历和两块大缓冲区的常驻占用。
+ */
+void accum_to_argb8888(const Vec* accum, int pixel_count, int frame_index, uint32_t* pixel_buffer) {
+    #pragma omp parallel for
+    for (int i = 0; i < pixel_count; ++i) {
+        Vec color = accum[i] * (1.0f / frame_index);
+        const float r = encode_display_value(color.x);
+        const float g = encode_display_value(color.y);
+        const float b = encode_display_value(color.z);
+        pixel_buffer[i] = (255u << 24) |
                           (static_cast<uint32_t>(r * 255.0f + 0.5f) << 16) |
                           (static_cast<uint32_t>(g * 255.0f + 0.5f) << 8) |
                           static_cast<uint32_t>(b * 255.0f + 0.5f);
@@ -158,8 +179,12 @@ int main(int argc, char** argv) {
     
     // CPU 侧像素映射缓冲区 (用于 SDL 显示)
     std::vector<uint32_t> pixel_buffer(w * h, 0);
-    std::vector<float> linear_rgb_frame(w * h * 3, 0.0f);
-    std::vector<float> blended_rgb_frame(w * h * 3, 0.0f);
+    std::vector<float> linear_rgb_frame;
+    std::vector<float> blended_rgb_frame;
+    if (kEnableNpuDenoiser) {
+        linear_rgb_frame.resize(static_cast<size_t>(w) * h * 3, 0.0f);
+        blended_rgb_frame.resize(static_cast<size_t>(w) * h * 3, 0.0f);
+    }
 
     FrameDenoiser denoiser;
     std::string last_denoiser_status;
@@ -211,30 +236,33 @@ int main(int argc, char** argv) {
         launch_render_kernel(d_accum, w, h, gpu_frame, 16, 8, cam_params, render_stats);
         
         // [C] 图像后处理与 NPU 降噪
-        build_linear_rgb_frame(d_accum, w * h, gpu_frame, linear_rgb_frame);
+        if (kEnableNpuDenoiser) {
+            build_linear_rgb_frame(d_accum, w * h, gpu_frame, linear_rgb_frame);
 
-        if (kEnableNpuDenoiser &&
-            denoiser.should_run(gpu_frame) &&
-            !denoiser.run(linear_rgb_frame.data(), w, h)) {
-            if (denoiser.status() != last_denoiser_status) {
-                std::cout << denoiser.status() << std::endl;
-                last_denoiser_status = denoiser.status();
+            if (denoiser.should_run(gpu_frame) &&
+                !denoiser.run(linear_rgb_frame.data(), w, h)) {
+                if (denoiser.status() != last_denoiser_status) {
+                    std::cout << denoiser.status() << std::endl;
+                    last_denoiser_status = denoiser.status();
+                }
             }
-        }
 
-        const float* active_rgb = linear_rgb_frame.data();
-        if (kEnableNpuDenoiser && denoiser.has_output()) {
-            const float alpha = denoiser.blend_alpha(gpu_frame);
-            if (alpha > 0.0f) {
-                blend_linear_rgb(linear_rgb_frame.data(),
-                                 denoiser.output_rgb().data(),
-                                 alpha,
-                                 w * h,
-                                 blended_rgb_frame);
-                active_rgb = blended_rgb_frame.data();
+            const float* active_rgb = linear_rgb_frame.data();
+            if (denoiser.has_output()) {
+                const float alpha = denoiser.blend_alpha(gpu_frame);
+                if (alpha > 0.0f) {
+                    blend_linear_rgb(linear_rgb_frame.data(),
+                                     denoiser.output_rgb().data(),
+                                     alpha,
+                                     w * h,
+                                     blended_rgb_frame);
+                    active_rgb = blended_rgb_frame.data();
+                }
             }
+            linear_rgb_to_argb8888(active_rgb, w * h, pixel_buffer.data());
+        } else {
+            accum_to_argb8888(d_accum, w * h, gpu_frame, pixel_buffer.data());
         }
-        linear_rgb_to_argb8888(active_rgb, w * h, pixel_buffer.data());
 
         // [D] 更新 SDL 屏幕
         SDL_UpdateTexture(texture, NULL, pixel_buffer.data(), w * sizeof(uint32_t));

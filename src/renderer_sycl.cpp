@@ -94,55 +94,59 @@ HOST_DEVICE uint32_t encode_milli(float value) {
     return static_cast<uint32_t>(safe * 1000.0f + 0.5f);
 }
 
+template <bool EnableStats>
 HOST_DEVICE void stats_increment(uint32_t* counter) {
-    sycl::atomic_ref<uint32_t,
-                     sycl::memory_order::relaxed,
-                     sycl::memory_scope::device,
-                     sycl::access::address_space::global_space> atomic_counter(*counter);
-    atomic_counter.fetch_add(1);
+    if constexpr (EnableStats) {
+        sycl::atomic_ref<uint32_t,
+                         sycl::memory_order::relaxed,
+                         sycl::memory_scope::device,
+                         sycl::access::address_space::global_space> atomic_counter(*counter);
+        atomic_counter.fetch_add(1);
+    }
 }
 
+template <bool EnableStats>
 HOST_DEVICE void stats_update_max(uint32_t* counter, float value) {
-    sycl::atomic_ref<uint32_t,
-                     sycl::memory_order::relaxed,
-                     sycl::memory_scope::device,
-                     sycl::access::address_space::global_space> atomic_counter(*counter);
-    atomic_counter.fetch_max(encode_milli(value));
+    if constexpr (EnableStats) {
+        sycl::atomic_ref<uint32_t,
+                         sycl::memory_order::relaxed,
+                         sycl::memory_scope::device,
+                         sycl::access::address_space::global_space> atomic_counter(*counter);
+        atomic_counter.fetch_max(encode_milli(value));
+    }
 }
 
+template <bool EnableStats>
 HOST_DEVICE Vec clamp_direct_light(Vec contribution, RenderStats* stats) {
     const float lum = luminance(contribution);
-    if (stats) {
-        stats_update_max(&stats->max_direct_light_lum_milli, lum);
-    }
+    stats_update_max<EnableStats>(&stats->max_direct_light_lum_milli, lum);
     if (lum > kDirectLightLumLimit) {
-        if (stats) {
-            stats_increment(&stats->direct_light_clamp_count);
-        }
+        stats_increment<EnableStats>(&stats->direct_light_clamp_count);
         contribution = contribution * (kDirectLightLumLimit / lum);
     }
     return contribution;
 }
 
+template <bool EnableStats>
 HOST_DEVICE Vec clamp_emissive_hit(Vec contribution, RenderStats* stats, bool primary_hit) {
     const float lum = luminance(contribution);
-    if (stats) {
-        stats_update_max(&stats->max_emissive_hit_lum_milli, lum);
+    stats_update_max<EnableStats>(&stats->max_emissive_hit_lum_milli, lum);
+    if constexpr (EnableStats) {
         if (primary_hit) {
-            stats_increment(&stats->emissive_hit_primary_count);
-            stats_update_max(&stats->max_emissive_hit_primary_lum_milli, lum);
+            stats_increment<true>(&stats->emissive_hit_primary_count);
+            stats_update_max<true>(&stats->max_emissive_hit_primary_lum_milli, lum);
         } else {
-            stats_increment(&stats->emissive_hit_indirect_count);
-            stats_update_max(&stats->max_emissive_hit_indirect_lum_milli, lum);
+            stats_increment<true>(&stats->emissive_hit_indirect_count);
+            stats_update_max<true>(&stats->max_emissive_hit_indirect_lum_milli, lum);
         }
     }
     if (lum > kEmissiveHitLumLimit) {
-        if (stats) {
-            stats_increment(&stats->emissive_hit_clamp_count);
+        if constexpr (EnableStats) {
+            stats_increment<true>(&stats->emissive_hit_clamp_count);
             if (primary_hit) {
-                stats_increment(&stats->emissive_hit_primary_clamp_count);
+                stats_increment<true>(&stats->emissive_hit_primary_clamp_count);
             } else {
-                stats_increment(&stats->emissive_hit_indirect_clamp_count);
+                stats_increment<true>(&stats->emissive_hit_indirect_clamp_count);
             }
         }
         contribution = contribution * (kEmissiveHitLumLimit / lum);
@@ -150,14 +154,15 @@ HOST_DEVICE Vec clamp_emissive_hit(Vec contribution, RenderStats* stats, bool pr
     return contribution;
 }
 
+template <bool EnableStats>
 HOST_DEVICE Vec clamp_throughput(Vec throughput, uint32_t* clamp_counter, RenderStats* stats) {
     const float max_comp = max_component(throughput);
-    if (stats) {
-        stats_update_max(&stats->max_throughput_component_milli, max_comp);
-    }
+    stats_update_max<EnableStats>(&stats->max_throughput_component_milli, max_comp);
     if (max_comp > kThroughputMaxComponent) {
-        if (stats && clamp_counter) {
-            stats_increment(clamp_counter);
+        if constexpr (EnableStats) {
+            if (clamp_counter) {
+                stats_increment<true>(clamp_counter);
+            }
         }
         throughput = throughput * (kThroughputMaxComponent / max_comp);
     }
@@ -330,6 +335,7 @@ HOST_DEVICE LightSample sample_light(const Object& light, const Vec& hit_point, 
  * @brief 路径追踪主算法 (Path Tracing Core)
  * 采用迭代式路径追踪，支持 BVH 遍历、PBR 材质、NEE 显式光源采样和 RR 俄罗斯轮盘赌
  */
+template <bool EnableStats>
 HOST_DEVICE Vec trace(Vec r_o,
                       Vec r_d,
                       Random& rng,
@@ -358,7 +364,7 @@ HOST_DEVICE Vec trace(Vec r_o,
         // [2] 累加自发光 (仅当满足镜面标记或第一帧，防止 NEE 重复计数)
         if (prev_was_specular && is_emissive) {
             Vec emissive_hit = throughput.mult(obj.emission);
-            emissive_hit = clamp_emissive_hit(emissive_hit, stats, depth == 0);
+            emissive_hit = clamp_emissive_hit<EnableStats>(emissive_hit, stats, depth == 0);
             radiance = radiance + emissive_hit;
         }
         if (is_emissive) break;
@@ -392,7 +398,7 @@ HOST_DEVICE Vec trace(Vec r_o,
             else r_d = (r_d * nnt - n * ((into ? 1 : -1) * (ddn * nnt + std::sqrt(cos2t)))).norm();
             r_o = x_hit + r_d * kRayEpsilon;
             throughput = throughput.mult(albedo) * (1.0f / std::max(transmission, 0.01f));
-            throughput = clamp_throughput(throughput, stats ? &stats->throughput_clamp_refract_count : nullptr, stats);
+            throughput = clamp_throughput<EnableStats>(throughput, EnableStats ? &stats->throughput_clamp_refract_count : nullptr, stats);
             prev_was_specular = true;
         } 
         else if (rnd < transmission + p_spec || (roughness < 0.03f)) {
@@ -410,7 +416,7 @@ HOST_DEVICE Vec trace(Vec r_o,
             // 确定性镜面判定：如果足够光滑，执行无损能量传输以消除噪声
             float weight = (roughness < 0.03f) ? 1.0f : std::max(p_spec, 0.01f);
             throughput = throughput.mult(F) * (1.0f / weight);
-            throughput = clamp_throughput(throughput, stats ? &stats->throughput_clamp_specular_count : nullptr, stats);
+            throughput = clamp_throughput<EnableStats>(throughput, EnableStats ? &stats->throughput_clamp_specular_count : nullptr, stats);
             prev_was_specular = true;
         } 
         else {
@@ -428,7 +434,7 @@ HOST_DEVICE Vec trace(Vec r_o,
                     Vec direct_light = throughput.mult(light.emission.mult(albedo)) *
                                        (nl.dot(light_sample.direction) * light_sample.light_cos * light_sample.area /
                                         (light_sample.distance_sq * M_PI * (1.0f / l_count)));
-                    direct_light = clamp_direct_light(direct_light, stats);
+                    direct_light = clamp_direct_light<EnableStats>(direct_light, stats);
                     radiance = radiance + direct_light;
                 }
             }
@@ -440,7 +446,7 @@ HOST_DEVICE Vec trace(Vec r_o,
             r_o = x_hit + nl * kRayEpsilon;
             float p_diff = std::max(1.0f - transmission - p_spec, 0.01f);
             throughput = throughput.mult(albedo) * (1.0f / p_diff);
-            throughput = clamp_throughput(throughput, stats ? &stats->throughput_clamp_diffuse_count : nullptr, stats);
+            throughput = clamp_throughput<EnableStats>(throughput, EnableStats ? &stats->throughput_clamp_diffuse_count : nullptr, stats);
             prev_was_specular = false; 
         }
 
@@ -450,7 +456,7 @@ HOST_DEVICE Vec trace(Vec r_o,
             if (p < 0.1f) p = 0.1f;
             if (rng.next_float() > p) break;
             throughput = throughput * (1.0f / p);
-            throughput = clamp_throughput(throughput, stats ? &stats->throughput_clamp_rr_count : nullptr, stats);
+            throughput = clamp_throughput<EnableStats>(throughput, EnableStats ? &stats->throughput_clamp_rr_count : nullptr, stats);
         }
     }
     return radiance;
@@ -503,46 +509,65 @@ void launch_render_kernel(Vec* accum_buffer_usm,
                           CameraParams cam,
                           RenderStats* stats_usm) {
     auto objects = d_objects; auto nodes = d_bvh_nodes; auto lights = d_light_indices; int l_count = d_light_count;
-    g_queue->submit([&](handler& h) {
-        h.parallel_for(nd_range<2>(range<2>(width, height), range<2>(tx, ty)), [=](nd_item<2> item) {
-            int x = item.get_global_id(0); int y = item.get_global_id(1);
-            if (x >= width || y >= height) return;
-            int i = y * width + x; 
-            Random rng(i, frame_seed);
-            
-            // 抗锯齿抖动
-            float fx = (float)(x + rng.next_float() - 0.5f) / width - 0.5f;
-            float fy = 0.5f - (float)(y + rng.next_float() - 0.5f) / height;
-            
-            Vec r_d = (cam.cx * fx + cam.cy * fy + cam.dir).norm();
-            Vec color = trace(cam.pos, r_d, rng, nodes, objects, lights, l_count, stats_usm);
-            
-            // --- 数值稳定性防火墙 ---
-            if (std::isnan(color.x) || std::isnan(color.y) || std::isnan(color.z) || std::isinf(color.x) || std::isinf(color.y) || std::isinf(color.z)) {
-                if (stats_usm) {
-                    stats_increment(&stats_usm->nan_or_inf_pixels);
+    if (stats_usm) {
+        g_queue->submit([&](handler& h) {
+            h.parallel_for(nd_range<2>(range<2>(width, height), range<2>(tx, ty)), [=](nd_item<2> item) {
+                int x = item.get_global_id(0); int y = item.get_global_id(1);
+                if (x >= width || y >= height) return;
+                int i = y * width + x;
+                Random rng(i, frame_seed);
+
+                float fx = (float)(x + rng.next_float() - 0.5f) / width - 0.5f;
+                float fy = 0.5f - (float)(y + rng.next_float() - 0.5f) / height;
+
+                Vec r_d = (cam.cx * fx + cam.cy * fy + cam.dir).norm();
+                Vec color = trace<true>(cam.pos, r_d, rng, nodes, objects, lights, l_count, stats_usm);
+
+                if (std::isnan(color.x) || std::isnan(color.y) || std::isnan(color.z) || std::isinf(color.x) || std::isinf(color.y) || std::isinf(color.z)) {
+                    stats_increment<true>(&stats_usm->nan_or_inf_pixels);
+                    color = {0, 0, 0};
                 }
-                color = {0,0,0};
-            }
-            color.x = std::max(0.0f, color.x); color.y = std::max(0.0f, color.y); color.z = std::max(0.0f, color.z);
-            
-            // Firefly Clamping (最终兜底)
-            // 正常运行时这层应保持开启，用于兜住少量仍然漏过前面分项裁剪的异常高亮样本。
-            float lum = luminance(color);
-            if (stats_usm) {
-                stats_update_max(&stats_usm->max_final_color_lum_milli, lum);
-            }
-            if (lum > kFinalFireflyLumLimit) {
-                if (stats_usm) {
-                    stats_increment(&stats_usm->final_firefly_clamp_count);
+                color.x = std::max(0.0f, color.x); color.y = std::max(0.0f, color.y); color.z = std::max(0.0f, color.z);
+
+                float lum = luminance(color);
+                stats_update_max<true>(&stats_usm->max_final_color_lum_milli, lum);
+                if (lum > kFinalFireflyLumLimit) {
+                    stats_increment<true>(&stats_usm->final_firefly_clamp_count);
+                    if (kApplyFinalFireflyClamp) {
+                        color = color * (kFinalFireflyLumLimit / lum);
+                    }
                 }
-                if (kApplyFinalFireflyClamp) {
+
+                accum_buffer_usm[i] = accum_buffer_usm[i] + color;
+            });
+        });
+    } else {
+        g_queue->submit([&](handler& h) {
+            h.parallel_for(nd_range<2>(range<2>(width, height), range<2>(tx, ty)), [=](nd_item<2> item) {
+                int x = item.get_global_id(0); int y = item.get_global_id(1);
+                if (x >= width || y >= height) return;
+                int i = y * width + x;
+                Random rng(i, frame_seed);
+
+                float fx = (float)(x + rng.next_float() - 0.5f) / width - 0.5f;
+                float fy = 0.5f - (float)(y + rng.next_float() - 0.5f) / height;
+
+                Vec r_d = (cam.cx * fx + cam.cy * fy + cam.dir).norm();
+                Vec color = trace<false>(cam.pos, r_d, rng, nodes, objects, lights, l_count, nullptr);
+
+                if (std::isnan(color.x) || std::isnan(color.y) || std::isnan(color.z) || std::isinf(color.x) || std::isinf(color.y) || std::isinf(color.z)) {
+                    color = {0, 0, 0};
+                }
+                color.x = std::max(0.0f, color.x); color.y = std::max(0.0f, color.y); color.z = std::max(0.0f, color.z);
+
+                float lum = luminance(color);
+                if (lum > kFinalFireflyLumLimit && kApplyFinalFireflyClamp) {
                     color = color * (kFinalFireflyLumLimit / lum);
                 }
-            }
-            
-            accum_buffer_usm[i] = accum_buffer_usm[i] + color;
+
+                accum_buffer_usm[i] = accum_buffer_usm[i] + color;
+            });
         });
-    });
+    }
     g_queue->wait();
 }
