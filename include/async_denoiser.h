@@ -55,14 +55,17 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::string status_;
 
+    // 后台工作线程：专门负责同步推理，避免主线程卡住。
     std::thread worker_;
 
+    // pending_* 这一组变量表示“最新待处理帧”。
     std::mutex pending_mutex_;
     std::condition_variable pending_cv_;
     std::vector<float> pending_frame_;
     int pending_frame_id_ = -1;
     bool pending_ready_ = false;
 
+    // ready_* 这一组变量表示“最近一帧已经推理完成、可安全显示的结果”。
     std::vector<float> result_buffers_[2];
     std::atomic<int> ready_buffer_index_{-1};
     std::atomic<int> ready_frame_id_{-1};

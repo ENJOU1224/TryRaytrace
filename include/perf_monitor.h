@@ -19,6 +19,7 @@
 using Clock = std::chrono::steady_clock;
 
 struct StartupPerf {
+    // 这些字段记录“程序刚启动时，各阶段一共花了多久”。
     double sdl_setup_ms = 0.0;
     double scene_create_ms = 0.0;
     double bvh_build_ms = 0.0;
@@ -31,12 +32,14 @@ struct StartupPerf {
 };
 
 struct DeviceMetrics {
+    // GT0 / GT1 是 Intel GPU 上两个主要图形执行单元的近似指标。
     double gt0_act_freq_mhz = -1.0;
     double gt1_act_freq_mhz = -1.0;
     double gt0_idle_delta_ms = -1.0;
     double gt1_idle_delta_ms = -1.0;
     double gt0_busy_pct = -1.0;
     double gt1_busy_pct = -1.0;
+    // NPU 指标同理，读不到时保持 -1。
     double npu_busy_pct = -1.0;
     double npu_freq_mhz = -1.0;
     double npu_mem_bytes = -1.0;
@@ -73,6 +76,7 @@ private:
 
 class PerfLogger {
 public:
+    // 构造时就打开日志文件并写表头，后续每帧只负责追加一行。
     explicit PerfLogger(const StartupPerf& startup);
     ~PerfLogger();
 

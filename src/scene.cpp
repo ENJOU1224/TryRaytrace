@@ -1,6 +1,11 @@
 #include "scene.h"
 #include "loader.h" 
 
+// scene.cpp 负责“把场景真正搭起来”。
+// 对初学者来说，这里回答的是两个问题：
+// 1. 画面里的几何体到底有哪些？
+// 2. 每个几何体的材质参数是怎么设置的？
+
 /**
  * add_quad 是场景搭建的小工具函数。
  *
@@ -16,6 +21,12 @@ Scene create_cornell_box() {
     Scene scene;
     scene.texture_files.push_back("assets/earth.ppm");
 
+    // Cornell Box 是光线追踪教学里很经典的测试场景。
+    // 它的优点是：
+    // - 空间结构简单
+    // - 左右墙有明显颜色串色
+    // - 顶灯会制造阴影和间接光
+    // 所以特别适合验证路径追踪是否工作正常。
     Vec white = {0.75f, 0.75f, 0.75f};
     Vec red   = {0.75f, 0.25f, 0.25f};
     Vec green = {0.25f, 0.75f, 0.25f};
@@ -27,6 +38,9 @@ Scene create_cornell_box() {
     // 实际会走更稳定的 diffuse 路径。
     float wall_m = 0.0f;
     float wall_r = 1.0f;
+
+    // 下面这些三角形共同围成一个近似盒子。
+    // 坐标单位没有强制物理含义，可以把它简单理解成“场景内部的长度单位”。
 
     // 1. 地板
     scene.objects.push_back(make_object({-50,0,0}, {50,0,600}, {150,0,0}, white, black, wall_m, wall_r));
@@ -53,6 +67,8 @@ Scene create_cornell_box() {
              0.0f);
 
     printf("[Scene] Scene created with %lu objects.\n", scene.objects.size());
+    // 额外计算整个场景的总包围盒。
+    // 当前主循环里还没有直接使用它，但它对调试和后续扩展很有帮助。
     scene.world_bound = AABB::empty();
     for (const auto& obj : scene.objects) {
       // 对象里只存 v0 + edge1/edge2，所以包围盒需要把另外两个顶点还原出来。

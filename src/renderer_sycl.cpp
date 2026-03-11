@@ -2,6 +2,7 @@
 #include "common.h"
 #include "aabb.h"
 #include "bvh.h"
+#include "ray_query_backend.h"
 #include <sycl/sycl.hpp>
 #include <iostream>
 #include <vector>
@@ -13,6 +14,13 @@ using namespace sycl;
  * ======================================================================================
  * [SYCL 渲染后端实现] 
  * 针对 Intel Xe2 架构 (Lunar Lake) 进行硬件指令级优化
+ *
+ * 这个文件是项目里“最像渲染器内核”的地方。
+ * 如果你第一次读路径追踪代码，建议按下面顺序看：
+ * 1. 先看最底部的 launch_render_kernel()，理解“一像素一线程”
+ * 2. 再看 trace()，理解“一条光线如何一路反弹”
+ * 3. 然后回头看 find_closest_hit() / is_shadowed() / sample_light()
+ * 4. 最后再看上面的统计和 clamp 辅助函数
  * ======================================================================================
  */
 
@@ -20,27 +28,28 @@ using namespace sycl;
 // [全局变量] 存储在设备可见的 USM 内存中
 // -----------------------------------------------------------------------------
 static queue* g_queue = nullptr;
+// d_objects / d_bvh_nodes / d_light_indices 都是“设备可见的场景副本”。
+// 主程序初始化场景后，会把 CPU 上的数据复制到这些 USM 指针里。
 static Object* d_objects = nullptr;
 static LinearBVHNode* d_bvh_nodes = nullptr;
 static int* d_light_indices = nullptr;
 static int d_light_count = 0;
 
+// 下面这些常量大多是“工程上为了稳住噪点”的经验参数。
+// 它们不是严格物理公式的一部分，而是为了让当前项目在实时反馈下更稳定。
 constexpr float kDirectLightLumLimit = 3.0f;
 constexpr float kEmissiveHitLumLimit = 4.0f;
 constexpr float kThroughputMaxComponent = 4.0f;
 constexpr float kFinalFireflyLumLimit = 2.0f;
 constexpr bool kApplyFinalFireflyClamp = true;
+// 射线起点偏移一个很小量，避免新射线立刻和自己刚命中的面再次相交。
 constexpr float kRayEpsilon = 0.001f;
+// 路径最多反弹多少次。
 constexpr int kMaxPathDepth = 5;
+// 从第几次 bounce 开始允许俄罗斯轮盘赌提前终止。
 constexpr int kRussianRouletteStartDepth = 3;
+// NEE 只在前几层做，后面层数太深时收益会下降。
 constexpr int kMaxNeeDepth = 3;
-
-struct SceneHit {
-    // t: 最近交点到射线原点的距离。
-    // object_id: 命中的三角形对象编号。-1 表示没有命中任何物体。
-    float t = 1e20f;
-    int object_id = -1;
-};
 
 struct LightSample {
     // 采样点指向光源点的单位方向
@@ -66,6 +75,8 @@ struct LightSample {
 struct Random {
     unsigned int state;
     HOST_DEVICE Random(unsigned int pixel_idx, unsigned int seed) {
+        // 把“像素坐标 + 帧种子”混成一个足够乱的初始状态。
+        // 这样不同像素、不同帧都能得到不同随机序列。
         unsigned int h = pixel_idx * 0x45d9f3bu + seed;
         h = ((h >> 16u) ^ h) * 0x45d9f3bu;
         h = ((h >> 16u) ^ h) * 0x45d9f3bu;
@@ -78,6 +89,7 @@ struct Random {
         return (word >> 22u) ^ word;
     }
     HOST_DEVICE float next_float() {
+        // 1 / 2^32，把 uint32 映射到 [0, 1) 浮点区间。
         return (float)next() * 2.3283064365386963e-10f; 
     }
 };
@@ -195,141 +207,13 @@ HOST_DEVICE Vec clamp_throughput(Vec throughput, uint32_t* clamp_counter, Render
 }
 
 /**
- * @brief 射线与单个三角形求交
- *
- * 这是 Moller-Trumbore 算法的直接实现，供主射线求交和阴影射线共用。
- * 抽成小函数有两个好处：
- * 1. 避免同一段代码在 trace() 和 shadow test 里各写一遍。
- * 2. 便于后续单独优化或替换成 watertight 版本。
- */
-HOST_DEVICE bool intersect_triangle(const Vec& ray_origin,
-                                    const Vec& ray_dir,
-                                    const Object& obj,
-                                    float t_min,
-                                    float t_max,
-                                    float& out_t) {
-    // 这里直接使用预计算的 edge1/edge2。
-    // 和每次现算相比，少掉了两次向量减法，也让代码更清晰。
-    Vec h = ray_dir.cross(obj.edge2);
-    float a = obj.edge1.dot(h);
-    if (a > -1e-5f && a < 1e-5f) {
-        return false;
-    }
-
-    float f = 1.0f / a;
-    Vec s = ray_origin - obj.v0;
-    float u = f * s.dot(h);
-    if (u < 0.0f || u > 1.0f) {
-        return false;
-    }
-
-    Vec q = s.cross(obj.edge1);
-    float v = f * ray_dir.dot(q);
-    if (v < 0.0f || u + v > 1.0f) {
-        return false;
-    }
-
-    float t = f * obj.edge2.dot(q);
-    if (t <= t_min || t >= t_max) {
-        return false;
-    }
-
-    out_t = t;
-    return true;
-}
-
-/**
- * @brief 在 BVH 中查找最近交点
- */
-HOST_DEVICE SceneHit find_closest_hit(const Vec& ray_origin,
-                                      const Vec& ray_dir,
-                                      const LinearBVHNode* bvh_nodes,
-                                      const Object* scene_objects) {
-    SceneHit hit;
-    // 固定大小栈：当前场景的 BVH 深度足够浅，32 层对这个项目是够用的。
-    int stack[32];
-    int stack_ptr = 0;
-    stack[stack_ptr++] = 0;
-    Vec ray_inv_dir = {1.0f / ray_dir.x, 1.0f / ray_dir.y, 1.0f / ray_dir.z};
-
-    while (stack_ptr > 0) {
-        // 深度优先遍历：每次弹出一个节点，先过 AABB，再决定是否进入叶子。
-        int idx = stack[--stack_ptr];
-        const auto& node = bvh_nodes[idx];
-        if (!node.bounds.hit(ray_origin, ray_inv_dir, kRayEpsilon, hit.t)) {
-            continue;
-        }
-
-        if (node.is_leaf) {
-            // 叶子节点里不再继续分裂，直接做若干个三角形求交。
-            for (int k = 0; k < node.primitive_count; ++k) {
-                int obj_idx = node.primitive_offset + k;
-                float t = hit.t;
-                if (intersect_triangle(ray_origin, ray_dir, scene_objects[obj_idx], kRayEpsilon, hit.t, t)) {
-                    hit.t = t;
-                    hit.object_id = obj_idx;
-                }
-            }
-        } else {
-            // 当前版本仍然采用固定顺序压栈。
-            // 这样简单稳妥，且在我们当前场景里比“额外算近远排序”更划算。
-            stack[stack_ptr++] = node.right_child_idx;
-            stack[stack_ptr++] = node.left_child_idx;
-        }
-    }
-
-    return hit;
-}
-
-/**
- * @brief 判断从表面点到采样光点的阴影射线是否被遮挡
- */
-HOST_DEVICE bool is_shadowed(const Vec& shadow_origin,
-                             const Vec& shadow_dir,
-                             float max_distance,
-                             const LinearBVHNode* bvh_nodes,
-                             const Object* scene_objects) {
-    // 阴影测试本质上是“任意命中就返回 true”，所以一旦找到一个遮挡物就可以提前结束。
-    int stack[32];
-    int stack_ptr = 0;
-    stack[stack_ptr++] = 0;
-    Vec inv_dir = {1.0f / shadow_dir.x, 1.0f / shadow_dir.y, 1.0f / shadow_dir.z};
-
-    while (stack_ptr > 0) {
-        int idx = stack[--stack_ptr];
-        if (!bvh_nodes[idx].bounds.hit(shadow_origin, inv_dir, kRayEpsilon, max_distance - 0.01f)) {
-            continue;
-        }
-
-        if (bvh_nodes[idx].is_leaf) {
-            for (int k = 0; k < bvh_nodes[idx].primitive_count; ++k) {
-                int object_id = bvh_nodes[idx].primitive_offset + k;
-                float t = max_distance;
-                if (intersect_triangle(shadow_origin,
-                                       shadow_dir,
-                                       scene_objects[object_id],
-                                       kRayEpsilon,
-                                       max_distance - 0.01f,
-                                       t)) {
-                    return true;
-                }
-            }
-        } else {
-            stack[stack_ptr++] = bvh_nodes[idx].right_child_idx;
-            stack[stack_ptr++] = bvh_nodes[idx].left_child_idx;
-        }
-    }
-
-    return false;
-}
-
-/**
  * @brief 从一个三角形面光源上采样一点
  */
 HOST_DEVICE LightSample sample_light(const Object& light, const Vec& hit_point, const Vec& surface_normal, Random& rng) {
     LightSample sample;
     // 这里对三角形面光源做重心坐标采样。
     // 这种写法简单，而且对三角形均匀采样是正确的。
+    // 直觉上可以理解成：先随机挑出一个“面积均匀”的三角形内部点。
     float lu = 1.0f - std::sqrt(rng.next_float());
     float lv = rng.next_float() * (1.0f - lu);
     Vec light_v1 = light.v0 + light.edge1;
@@ -372,11 +256,12 @@ template <bool EnableStats>
 HOST_DEVICE Vec trace(Vec r_o,
                       Vec r_d,
                       Random& rng,
-                      const LinearBVHNode* bvh_nodes,
-                      const Object* scene_objects,
-                      const int* light_indices,
-                      int l_count,
+                      const ray_query_backend::SceneView& scene,
                       RenderStats* stats) {
+    // 可以把这整个函数理解成：
+    // “从相机发出一条光线，不断命中物体、不断改方向、不断累计贡献，
+    //  直到跑出场景或被提前终止。”
+
     // radiance: 当前路径已经累积到的出射辐射
     Vec radiance = {0, 0, 0};
     // throughput: 当前路径从相机走到这里的累计权重
@@ -387,12 +272,13 @@ HOST_DEVICE Vec trace(Vec r_o,
 
     for (int depth = 0; depth < kMaxPathDepth; depth++) {
         // 1. 找最近交点
-        SceneHit hit = find_closest_hit(r_o, r_d, bvh_nodes, scene_objects);
+        ray_query_backend::SceneHit hit =
+            ray_query_backend::find_closest_hit(scene, r_o, r_d, kRayEpsilon);
 
         // 光线逸出场景，整条路径到此结束
         if (hit.object_id < 0) break;
 
-        const Object& obj = scene_objects[hit.object_id];
+        const Object& obj = scene.objects[hit.object_id];
         Vec x_hit = r_o + r_d * hit.t;
         Vec n = obj.normal;
         // nl 是“面向来射光线的法线”
@@ -413,6 +299,10 @@ HOST_DEVICE Vec trace(Vec r_o,
         if (is_emissive) break;
 
         // 3. 准备材质参数
+        // 这里把“材质会怎么反弹光线”简化成三个大类：
+        // - transmission: 折射
+        // - p_spec: 镜面/金属
+        // - 剩下的概率: 漫反射
         Vec albedo = obj.albedo;
         float metallic = obj.metallic, roughness = obj.roughness, transmission = obj.transmission;
         float cos_theta = std::abs(r_d.dot(nl));
@@ -429,7 +319,9 @@ HOST_DEVICE Vec trace(Vec r_o,
         // 为了验证这一点，这里先让“高粗糙非金属非透射材质”退回纯漫反射。
         float p_spec = is_rough_dielectric ? 0.0f : (F.x + F.y + F.z) * 0.3333f;
 
-        // 用一个随机数决定本次路径落入哪种 BSDF 分支
+        // 用一个随机数决定本次路径落入哪种 BSDF 分支。
+        // 这就是 Monte Carlo 采样的核心味道：
+        // 不是“三种都算”，而是“按概率选一种，再用权重补偿”。
         float rnd = rng.next_float();
         
         // [4] BSDF 采样分支选择 (重要性采样)
@@ -442,6 +334,8 @@ HOST_DEVICE Vec trace(Vec r_o,
             if (cos2t < 0) r_d = (r_d - n * 2.0f * r_d.dot(n)).norm();
             else r_d = (r_d * nnt - n * ((into ? 1 : -1) * (ddn * nnt + std::sqrt(cos2t)))).norm();
             r_o = x_hit + r_d * kRayEpsilon;
+            // 因为本次只采样了“折射”这一支，所以要除以它被采中的概率，
+            // 才能保持整体估计无偏。
             throughput = throughput.mult(albedo) * (1.0f / std::max(transmission, 0.01f));
             throughput = clamp_throughput<EnableStats>(throughput, EnableStats ? &stats->throughput_clamp_refract_count : nullptr, stats);
             prev_was_specular = true;
@@ -461,6 +355,7 @@ HOST_DEVICE Vec trace(Vec r_o,
             r_o = x_hit + nl * kRayEpsilon;
             // 如果足够光滑，就把它近似成确定性镜面，减少不必要噪声。
             float weight = (roughness < 0.03f) ? 1.0f : std::max(p_spec, 0.01f);
+            // F 是菲涅尔反射率，表示“这一跳有多少能量被反射出来”。
             throughput = throughput.mult(F) * (1.0f / weight);
             throughput = clamp_throughput<EnableStats>(throughput, EnableStats ? &stats->throughput_clamp_specular_count : nullptr, stats);
             prev_was_specular = true;
@@ -470,21 +365,22 @@ HOST_DEVICE Vec trace(Vec r_o,
             // 这里会分两件事：
             // 1. 先做一次显式光源采样（NEE）
             // 2. 再做一次半球随机采样，继续往场景里追踪
-            if (l_count > 0 && depth < kMaxNeeDepth) {
-                const Object& light = scene_objects[light_indices[(int)(rng.next_float() * l_count)]];
+            if (scene.light_count > 0 && depth < kMaxNeeDepth) {
+                const Object& light =
+                    scene.objects[scene.light_indices[(int)(rng.next_float() * scene.light_count)]];
                 LightSample light_sample = sample_light(light, x_hit, nl, rng);
                 if (light_sample.valid &&
-                    !is_shadowed(x_hit + nl * kRayEpsilon,
-                                 light_sample.direction,
-                                 light_sample.distance,
-                                 bvh_nodes,
-                                 scene_objects)) {
+                    !ray_query_backend::is_shadowed(scene,
+                                                    x_hit + nl * kRayEpsilon,
+                                                    light_sample.direction,
+                                                    kRayEpsilon,
+                                                    light_sample.distance)) {
                     // 直接光的估计值。
                     // 这里本质还是 path tracing，只是把“灯的那一段”显式采样出来，
                     // 方差比纯靠随机命中灯要小很多。
                     Vec direct_light = throughput.mult(light.emission.mult(albedo)) *
                                        (nl.dot(light_sample.direction) * light_sample.light_cos * light_sample.area /
-                                        (light_sample.distance_sq * M_PI * (1.0f / l_count)));
+                                        (light_sample.distance_sq * M_PI * (1.0f / scene.light_count)));
                     direct_light = clamp_direct_light<EnableStats>(direct_light, stats);
                     radiance = radiance + direct_light;
                 }
@@ -497,6 +393,7 @@ HOST_DEVICE Vec trace(Vec r_o,
             r_d = (basis_u * std::cos(r1) * r2s + basis_v * std::sin(r1) * r2s + w * std::sqrt(std::max(0.0f, 1.0f-r2))).norm();
             r_o = x_hit + nl * kRayEpsilon;
             float p_diff = std::max(1.0f - transmission - p_spec, 0.01f);
+            // Lambert 漫反射这里同样要除以“本分支被选中的概率”。
             throughput = throughput.mult(albedo) * (1.0f / p_diff);
             throughput = clamp_throughput<EnableStats>(throughput, EnableStats ? &stats->throughput_clamp_diffuse_count : nullptr, stats);
             prev_was_specular = false; 
@@ -505,6 +402,8 @@ HOST_DEVICE Vec trace(Vec r_o,
         // 5. 俄罗斯轮盘赌 (RR)
         // 当路径够深时，用概率方式提前终止长路径，避免把时间都耗在贡献很小的尾部 bounce 上。
         if (depth >= kRussianRouletteStartDepth) {
+            // 这里用 albedo 最大通道当作“还有没有必要继续追”的粗略代理。
+            // 值越小，说明这条路径后面剩余贡献大概率已经很弱。
             float p = albedo.x > albedo.y ? (albedo.x > albedo.z ? albedo.x : albedo.z) : (albedo.y > albedo.z ? albedo.y : albedo.z);
             if (p < 0.1f) p = 0.1f;
             if (rng.next_float() > p) break;
@@ -522,11 +421,14 @@ HOST_DEVICE Vec trace(Vec r_o,
 void init_renderer_sycl() {
     if (!g_queue) {
         try { 
+            // 优先选择 GPU；如果当前环境不支持，再回退到 CPU。
             g_queue = new queue(gpu_selector_v); 
             std::cout << "[SYCL] Device: " << g_queue->get_device().get_info<info::device::name>() << std::endl;
+            std::cout << "[RayQuery] Backend: " << ray_query_backend::kSelectedBackendName << std::endl;
         } catch (...) { 
             g_queue = new queue(cpu_selector_v); 
             std::cout << "[SYCL] Fallback to CPU." << std::endl;
+            std::cout << "[RayQuery] Backend: " << ray_query_backend::kSelectedBackendName << std::endl;
         }
     }
 }
@@ -539,6 +441,9 @@ queue& get_renderer_queue() {
 void init_scene_data(const std::vector<Object>& objects, const std::vector<std::string>& texture_files, const std::vector<LinearBVHNode>& nodes, const std::vector<int>& light_indices) {
     init_renderer_sycl();
     (void)texture_files;
+    // 这里做的是“CPU 场景 -> 设备可见 USM 缓冲”的一次性复制。
+    // 场景不变时，这些数据之后每一帧都可以反复复用。
+    ray_query_backend::shutdown_scene_backend(*g_queue);
     if (d_objects) free(d_objects, *g_queue);
     d_objects = malloc_shared<Object>(objects.size(), *g_queue);
     std::memcpy(d_objects, objects.data(), objects.size() * sizeof(Object));
@@ -547,10 +452,13 @@ void init_scene_data(const std::vector<Object>& objects, const std::vector<std::
     std::memcpy(d_bvh_nodes, nodes.data(), nodes.size() * sizeof(LinearBVHNode));
     d_light_count = light_indices.size();
     if (d_light_indices) free(d_light_indices, *g_queue);
+    d_light_indices = nullptr;
     if (d_light_count > 0) {
         d_light_indices = malloc_shared<int>(d_light_count, *g_queue);
         std::memcpy(d_light_indices, light_indices.data(), d_light_count * sizeof(int));
     }
+
+    ray_query_backend::initialize_scene_backend(*g_queue, objects, nodes);
 }
 
 void launch_render_kernel(Vec* accum_buffer_usm,
@@ -561,21 +469,28 @@ void launch_render_kernel(Vec* accum_buffer_usm,
                           int ty,
                           CameraParams cam,
                           RenderStats* stats_usm) {
+    // 把全局设备指针拷贝到局部变量中，便于 lambda 捕获。
     auto objects = d_objects; auto nodes = d_bvh_nodes; auto lights = d_light_indices; int l_count = d_light_count;
+    ray_query_backend::SceneView scene = {objects, nodes, lights, l_count};
+    ray_query_backend::set_scene_view_backend_state(scene);
     if (stats_usm) {
         g_queue->submit([&](handler& h) {
             h.parallel_for(nd_range<2>(range<2>(width, height), range<2>(tx, ty)), [=](nd_item<2> item) {
+                // 一 个 work-item 负责一个像素。
                 int x = item.get_global_id(0); int y = item.get_global_id(1);
                 if (x >= width || y >= height) return;
                 int i = y * width + x;
                 Random rng(i, frame_seed);
 
+                // 给像素中心加一点随机抖动，等价于做最基础的抗锯齿 / 随机超采样。
                 float fx = (float)(x + rng.next_float() - 0.5f) / width - 0.5f;
                 float fy = 0.5f - (float)(y + rng.next_float() - 0.5f) / height;
 
+                // 用相机参数把屏幕像素映射成一条世界空间射线。
                 Vec r_d = (cam.cx * fx + cam.cy * fy + cam.dir).norm();
-                Vec color = trace<true>(cam.pos, r_d, rng, nodes, objects, lights, l_count, stats_usm);
+                Vec color = trace<true>(cam.pos, r_d, rng, scene, stats_usm);
 
+                // 数值兜底：如果出现 NaN/Inf，就把这个像素记黑并做统计。
                 if (std::isnan(color.x) || std::isnan(color.y) || std::isnan(color.z) || std::isinf(color.x) || std::isinf(color.y) || std::isinf(color.z)) {
                     stats_increment<true>(&stats_usm->nan_or_inf_pixels);
                     color = {0, 0, 0};
@@ -591,6 +506,8 @@ void launch_render_kernel(Vec* accum_buffer_usm,
                     }
                 }
 
+                // 这里不是覆盖，而是累加。
+                // 因为路径追踪的最终显示结果依赖“多帧平均”。
                 accum_buffer_usm[i] = accum_buffer_usm[i] + color;
             });
         });
@@ -606,7 +523,7 @@ void launch_render_kernel(Vec* accum_buffer_usm,
                 float fy = 0.5f - (float)(y + rng.next_float() - 0.5f) / height;
 
                 Vec r_d = (cam.cx * fx + cam.cy * fy + cam.dir).norm();
-                Vec color = trace<false>(cam.pos, r_d, rng, nodes, objects, lights, l_count, nullptr);
+                Vec color = trace<false>(cam.pos, r_d, rng, scene, nullptr);
 
                 if (std::isnan(color.x) || std::isnan(color.y) || std::isnan(color.z) || std::isinf(color.x) || std::isinf(color.y) || std::isinf(color.z)) {
                     color = {0, 0, 0};
@@ -622,5 +539,7 @@ void launch_render_kernel(Vec* accum_buffer_usm,
             });
         });
     }
+    // main.cpp 设计成“发一帧就等这一帧完成”，所以这里直接 wait。
+    // 如果以后要做更深的 CPU/GPU 异步流水线，这里会是一个可继续优化的点。
     g_queue->wait();
 }

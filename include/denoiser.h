@@ -36,9 +36,11 @@ public:
     bool has_output() const;
 
     /// 根据当前帧号判断这一帧是否应触发一次推理。
+    /// 这个接口是给“同步版降噪流程”预留的；异步版当前直接每次都可提交。
     bool should_run(int frame_index) const;
 
     /// 当前帧实际采用多大比例的降噪结果做显示混合。
+    /// 当前主程序没有使用这个混合值，但它保留了“以后做平滑过渡显示”的能力。
     float blend_alpha(int frame_index) const;
 
     /**
@@ -63,6 +65,8 @@ public:
     const std::string& device_name() const;
 
 private:
+    // PImpl 写法：把 OpenVINO 头文件和复杂实现细节藏到 cpp 里，
+    // 减少头文件污染，也让编译依赖更清晰。
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

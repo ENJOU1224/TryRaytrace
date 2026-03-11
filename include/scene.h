@@ -26,21 +26,37 @@ enum Refl_t {
 // 3. 这会增加一些显存占用，但对当前路径追踪器来说，减少 kernel 内重复算术更划算。
 // --------------------------------------------------------------------------------------
 struct ALIGN(16) Object {
+    // v0 是三角形第一个顶点。
     Vec v0 = {0.0f, 0.0f, 0.0f};
+    // edge1 = v1 - v0，edge2 = v2 - v0。
+    // 这样存的好处是：
+    // 1. 求交时直接可用；
+    // 2. 节省一点重复顶点表达；
+    // 3. 更符合 Moller-Trumbore 求交公式。
     Vec edge1 = {0.0f, 0.0f, 0.0f};
     Vec edge2 = {0.0f, 0.0f, 0.0f};
+    // normal 是几何法线，不是法线贴图结果。
     Vec normal = {0.0f, 0.0f, 0.0f};
+    // albedo 是基础颜色，决定物体本身“偏什么色”。
     Vec albedo = {0.0f, 0.0f, 0.0f};
+    // emission 是自发光颜色；不为 0 时，这个三角形就相当于灯。
     Vec emission = {0.0f, 0.0f, 0.0f};
 
+    // metallic 越高，越像金属；roughness 越高，反射越散。
     float metallic = 0.0f;
     float roughness = 1.0f;
+    // ior = Index of Refraction，折射率。玻璃/水之类会用到。
     float ior = 1.45f;
+    // transmission 越高，越倾向于走“透过去”的折射路径。
     float transmission = 0.0f;
+    // area 用于面光源采样时的 PDF / 几何项计算。
     float area = 0.0f;
 
+    // 纹理编号。当前项目几乎没真正展开纹理系统，所以默认 -1 表示未使用。
     int tex_id = -1;
     
+    // 补齐用的填充字段。
+    // 它们没有业务意义，主要是为了保持结构体内存布局更规整。
     float pad1 = 0.0f;
     float pad2 = 0.0f;
 };
@@ -115,9 +131,12 @@ struct CameraParams {
 // 这是一个纯 CPU 端的数据容器，负责管理资源的生命周期。
 // 使用 std::vector 可以方便地动态添加物体。
 struct Scene {
+    // 这是最终送给渲染器和 BVH 的三角形列表。
     std::vector<Object> objects;
+    // 当前只保存纹理文件路径列表，真正的纹理采样还不是项目主线。
     std::vector<std::string> texture_files;
 
+    // 整个场景的大包围盒，可用于后续整体裁剪或调试。
     AABB world_bound;
 };
 

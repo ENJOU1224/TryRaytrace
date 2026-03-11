@@ -3,6 +3,16 @@
 #include <cmath>
 #include <algorithm>
 
+// 这个头文件是整个项目最基础的“公共数学层”。
+// 你可以把它理解成：
+// 1. 先统一 CPU / GPU 共享的数据布局；
+// 2. 再提供最常用的向量运算；
+// 3. 最后提供“渲染结果如何变成屏幕颜色”的辅助函数。
+//
+// 如果你是第一次读这个项目，建议把这个文件当成“词典”：
+// - Vec 是最核心的数据类型；
+// - clamp / tone_map / Gamma 是显示链路最核心的几个概念。
+
 // 处理 CUDA 和 SYCL 的兼容性宏
 #if defined(__CUDACC__)
     #include <cuda_runtime.h>
@@ -37,6 +47,10 @@
 // 2. 正确性: 强制 CPU 和 GPU 使用相同的内存布局。
 //    防止因为编译器默认对齐策略不同，导致 CPU 传给 GPU 的数据错位 (比如我们之前遇到的镜面球变玻璃球的问题)。
 struct ALIGN(16) Vec {
+    // 在不同上下文里，它可能表示：
+    // - 3D 坐标 (位置)
+    // - 方向向量
+    // - RGB 颜色
     float x, y, z; 
 
     HOST_DEVICE Vec operator+(const Vec& b) const { 
@@ -80,6 +94,10 @@ struct ALIGN(16) Vec {
         return {y * b.z - z * b.y, z * b.x - x * b.z, x * b.y - y * b.x}; 
     }
 
+    // 返回向量长度。
+    // 这和 norm() 的区别是：
+    // - norm() 会“原地修改自己并归一化”
+    // - norm_len() 只负责计算长度，不改内容
     HOST_DEVICE float norm_len() const { return std::sqrt(x*x + y*y + z*z); }
 };
 

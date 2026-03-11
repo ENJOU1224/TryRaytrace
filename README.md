@@ -2,6 +2,15 @@
 
 这是一个针对 **Intel Lunar Lake (Core Ultra 258V)** 架构深度优化的路径追踪渲染器。它成功地将原本的 NVIDIA CUDA 后端迁移到了现代的 **Intel oneAPI (SYCL)** 架构，实现了在集成核显 (Arc 140V) 上的高性能硬件加速。
 
+如果你是第一次接触这个项目，可以先把它理解成一条完整的数据流：
+
+1. CPU 先创建场景、构建 BVH、准备相机参数。
+2. GPU 上的 SYCL kernel 为每个像素发射一条主光线，并执行路径追踪。
+3. 每一帧的结果不是直接覆盖，而是累加到 `accum buffer` 里。
+4. 显示前，CPU 会把累积结果除以当前帧数，得到“当前平均颜色”。
+5. 如果启用了 NPU 降噪，线性 RGB 会提交给后台线程，显示端读取最近完成的降噪结果。
+6. 最终画面经过 Tone Mapping 和 Gamma 校正，再送到 SDL 窗口显示。
+
 ## 🚀 核心特性
 
 - **跨架构支持**: 基于 SYCL 标准编写，可在 Intel GPU (Level Zero/OpenCL) 和 CPU 上无缝切换。
@@ -22,6 +31,76 @@
   - 当前内置模型是一个 `5x5` 高斯残差卷积降噪器，带简单的高亮保护，输入输出均为当前窗口分辨率。
   - 主程序默认启用异步 NPU 流水线：GPU 持续渲染，NPU 后台处理最近提交的一帧，并显示最近完成的降噪结果。
   - 若未检测到 `NPU` 或 NPU 编译失败，渲染器会自动回退到原始画面，不影响主渲染流程。
+- **Embree GPU 查询后端**:
+  - 当前项目已经把“几何查询层”和“路径追踪/材质层”解耦。
+  - 在支持的 Intel GPU 上，可切到 Embree GPU 后端，用硬件 RT 能力替换软件 BVH 遍历与求交。
+  - 材质、NEE、吞吐量控制、firefly 处理等主逻辑仍保留在现有渲染器里。
+
+## 📚 给初学者的阅读指南
+
+这个项目已经不算“最小教学样例”，而是一个能跑、能优化、能记录性能的完整工程。所以建议不要从最大的文件硬啃，而是按下面顺序看：
+
+1. [`include/common.h`](include/common.h)
+   - 先认识 `Vec`、`clamp`、`tone_map_reinhard`、`encode_display_value`。
+   - 这几个定义决定了“颜色如何表示”和“最终怎么显示到屏幕上”。
+
+2. [`include/scene.h`](include/scene.h) 和 [`src/scene.cpp`](src/scene.cpp)
+   - 先搞清楚 `Object` 里到底存了什么。
+   - 再看 Cornell Box 和茶壶是怎么被放进场景里的。
+
+3. [`include/camera.h`](include/camera.h) 和 [`src/camera.cpp`](src/camera.cpp)
+   - 理解相机的位置、朝向、视野是怎么转换成 `CameraParams` 的。
+   - 这里是“屏幕像素如何变成一条射线”的前置步骤。
+
+4. [`include/aabb.h`](include/aabb.h)、[`include/bvh.h`](include/bvh.h)、[`src/bvh.cpp`](src/bvh.cpp)
+   - 理解为什么不能让每条射线都和全部三角形直接求交。
+   - 这里是加速结构部分，也是路径追踪真正可用的关键。
+
+5. [`src/main.cpp`](src/main.cpp)
+   - 把它当作总调度器来看。
+   - 它负责把输入、渲染、降噪、显示、日志这些模块串起来。
+
+6. [`src/renderer_sycl.cpp`](src/renderer_sycl.cpp)
+   - 这是渲染核心。
+   - 建议先看 `launch_render_kernel()`，再看 `trace()`，最后回头看求交、阴影和光源采样辅助函数。
+
+7. [`include/ray_query_backend.h`](include/ray_query_backend.h)、[`include/ray_query_backend_software.h`](include/ray_query_backend_software.h)、[`include/ray_query_backend_embree.h`](include/ray_query_backend_embree.h)
+   - 这是当前“可插拔几何查询层”的入口。
+   - 如果你想理解“为什么后来能接入 Embree GPU，但又不重写整套材质逻辑”，这里非常关键。
+
+8. [`src/frame_processing.cpp`](src/frame_processing.cpp)、[`src/async_denoiser.cpp`](src/async_denoiser.cpp)、[`src/denoiser_openvino.cpp`](src/denoiser_openvino.cpp)
+   - 这部分属于“显示链”和“NPU 降噪链”。
+   - 当你已经看懂主渲染链后，再看这里会更容易。
+
+## 🧭 核心概念速览
+
+- `Vec`
+  - 项目里最常见的基础类型。
+  - 在不同地方分别表示位置、方向、法线和 RGB 颜色。
+
+- `Object`
+  - 当前渲染器里的最小几何单位是三角形。
+  - 每个 `Object` 都存了顶点、边向量、法线、材质参数和发光参数。
+
+- `LinearBVHNode`
+  - GPU 友好的 BVH 节点表示。
+  - 内部节点存子节点索引，叶子节点存一段连续三角形范围。
+
+- `CameraParams`
+  - 每一帧从 CPU 传给 GPU 的相机快照。
+  - 里面包含位置、朝向和成像平面的两个基向量。
+
+- `accum buffer`
+  - 路径追踪不是单帧就收敛，所以每帧结果要累加。
+  - 显示时再除以当前采样帧数，得到平均结果。
+
+- `throughput`
+  - 表示一条路径走到当前 bounce 时，剩余的能量权重有多少。
+  - 如果它失控变得很大，就容易产生 fireflies。
+
+- `NEE`
+  - Next Event Estimation，显式光源采样。
+  - 漫反射命中后，不只随机反弹，还会额外主动去采样光源，降低噪点。
 
 ## 🧪 已落地的专项优化
 
@@ -74,17 +153,38 @@
 
 2. **编译项目**:
    ```bash
-   make -j$(nproc)
+   make build-embree
+   ```
+   如果你看到类似下面的报错：
+   ```text
+   错误：Intel oneAPI 环境未就绪。
+   ```
+   说明当前 shell 还没有 `source ~/intel/oneapi/setvars.sh`。
+
+   如果你想强制切回旧的软件 BVH 查询后端：
+   ```bash
+   make build-software
    ```
 
 3. **运行渲染器**:
    ```bash
-    ./bin/sycl_engine
+   make run-embree
    ```
    默认行为:
    - 启用异步 NPU 降噪流水线
    - 终端显示 `FPS / Frame / Present / DenoiseLag`
    - 自动记录 `logs/perf_*.csv` 性能日志
+
+   如果你想临时关闭 NPU 降噪，只看纯渲染性能：
+   ```bash
+   make run-embree-no-denoise
+   ```
+
+   如果你已经手动切到软件后端，也可以直接用：
+   ```bash
+   make run
+   make run-no-denoise
+   ```
 
 4. **检查 OpenVINO 是否识别到 NPU**:
    ```bash
@@ -94,9 +194,89 @@
 5. **运行单帧降噪对比演示**:
    ```bash
    make denoise-demo
-   ./bin/denoise_demo
+   make run-denoise-demo
    ```
    演示程序会只渲染一帧，然后每 2 秒在“原始单帧图 / NPU 降噪图”之间自动切换。
+
+## ⚙️ Embree GPU 使用说明
+
+当前默认几何查询后端已经切到 `embree`。这意味着：
+
+1. 主程序仍然是你原来的路径追踪器。
+2. 但“最近交点查询 / 阴影遮挡查询”已经可以走 Embree GPU。
+3. 所以当前项目是“自研路径追踪主逻辑 + 可替换几何查询后端”的混合结构。
+
+当前本机默认路径：
+
+- `EMBREE_ROOT = ~/intel/embree-4.4.0.sycl.x86_64.linux`
+- `RTAS_SUPPORT_ROOT = ~/Downloads/level-zero-raytracing-support-1.2.3/build`
+
+其中 `RTAS_SUPPORT_ROOT` 对应你本地编出来的 Level Zero RTAS builder 支持库。
+如果这条链缺失，Embree GPU 往往会在 `rtcNewSYCLDevice()` 阶段报 `ZE_experimental_rtas_builder extension` 不可用。
+
+为了方便定位这条链是否工作，项目里还提供了一个最小探针：
+
+```bash
+make embree-probe
+make run-embree-probe-live
+```
+
+它不会启动整个渲染器，只验证：
+
+- Embree 是否能识别当前 SYCL GPU
+- 是否能创建 `RTCTraversable`
+- `rtcTraversableIntersect1 / rtcTraversableOccluded1` 是否能在 GPU 上工作
+
+## 🖼️ 主程序每一帧在做什么
+
+把 [`src/main.cpp`](src/main.cpp) 的主循环简化后，可以概括成下面几步：
+
+1. 读取输入
+   - 键盘和鼠标事件由 `InputManager` 处理。
+   - 如果相机发生移动，当前累积结果会被清空。
+
+2. 生成相机参数
+   - `CameraController` 根据当前位置和朝向生成 `CameraParams`。
+   - GPU 端依赖它把屏幕像素换算成世界空间主光线。
+
+3. 发射渲染 kernel
+   - `launch_render_kernel()` 会为每个像素运行一个 work-item。
+   - 每个像素都会生成随机数、发射主光线、执行路径追踪，并把结果累加进 `accum buffer`。
+
+4. 构建显示输入
+   - 如果启用 NPU，主线程会先把累积缓冲转换成线性 RGB 浮点图。
+   - 如果未启用 NPU，则直接把累积缓冲转换成 ARGB 显示图。
+
+5. 后台降噪
+   - 异步降噪线程始终优先处理“最近提交的一帧”。
+   - 显示端不等待 NPU，而是显示最近已经完成的一帧结果。
+
+6. 屏幕显示与日志
+   - SDL 负责把 ARGB 缓冲送到窗口。
+   - 同时程序会记录 FPS、阶段耗时、GPU/NPU 估算指标到 `logs/perf_*.csv`。
+
+## 🔦 渲染核心一条路径是怎么走的
+
+[`src/renderer_sycl.cpp`](src/renderer_sycl.cpp) 里的 `trace()` 是项目最核心的算法函数。可以把它理解成这样：
+
+1. 从相机发出一条主光线。
+2. 通过 BVH 找最近命中的三角形。
+3. 如果命中了发光体，在合适条件下把自发光累计进结果。
+4. 根据材质参数决定下一跳更像：
+   - 折射
+   - 镜面反射
+   - 漫反射
+5. 如果是漫反射，还会额外做一次 NEE 光源采样。
+6. 更新 `throughput`，表示路径还能带着多少能量继续往后走。
+7. 当路径过深时，通过俄罗斯轮盘赌提前结束低贡献路径。
+8. 重复以上流程，直到光线飞出场景或被终止。
+
+这个实现不是离线电影渲染器那种“最完整、最重型”的 BSDF 系统，而是一个更偏工程稳定性的实时学习版本：
+
+- 材质分支做了实用简化
+- 对 firefly 做了多层限幅
+- 对 NaN/Inf 做了兜底清理
+- 更强调“能稳定跑、能看懂、能继续调参”
 
 ## 🧠 NPU 降噪使用方式
 
@@ -118,15 +298,23 @@
   - 算子非常简单，NPU 兼容性高
   - 代码可直接阅读，适合学习 OpenVINO 图构建与 NPU 部署
 
+如果你想专门看降噪链路，建议顺序是：
+
+1. [`include/denoiser.h`](include/denoiser.h)
+2. [`src/denoiser_openvino.cpp`](src/denoiser_openvino.cpp)
+3. [`include/async_denoiser.h`](include/async_denoiser.h)
+4. [`src/async_denoiser.cpp`](src/async_denoiser.cpp)
+5. [`src/frame_processing.cpp`](src/frame_processing.cpp)
+
 ## 🔍 诊断模式
 
 默认运行时不会打印逐帧诊断统计。
 如果后续还需要继续排查 fireflies 或继续做性能实验，可以直接改下面几个代码开关：
 
-- [main.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/main.cpp#L41) 的 `kEnableNpuDenoiser`
-- [main.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/main.cpp#L42) 的 `kEnableDiagnosticStats`
-- [main.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/main.cpp#L46) 和 [main.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/main.cpp#L47) 的工作组配置
-- [renderer_sycl.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/renderer_sycl.cpp#L34) 到 [renderer_sycl.cpp](/home/enjou/temp/2026/3/TryRaytrace/src/renderer_sycl.cpp#L36) 的路径深度和 NEE 范围
+- [`src/main.cpp`](src/main.cpp) 里的 `kEnableNpuDenoiser`
+- [`src/main.cpp`](src/main.cpp) 里的 `kEnableDiagnosticStats`
+- [`src/main.cpp`](src/main.cpp) 里的 `kRenderTileWidth / kRenderTileHeight`
+- [`src/renderer_sycl.cpp`](src/renderer_sycl.cpp) 里的 `kMaxPathDepth / kRussianRouletteStartDepth / kMaxNeeDepth`
 
 `perf_*.csv` 当前会记录：
 - `input_ms / render_ms / post_ms / present_ms / denoise_ms / total_ms / fps`
@@ -146,12 +334,40 @@
 - `include/`: 核心数学库与 AABB/BVH 定义
 - `src/main.cpp`: 主调度器，负责输入、渲染、显示、异步降噪协同
 - `src/renderer_sycl.cpp`: SYCL 渲染核心 (GPU Kernels)
+- `include/ray_query_backend.h`: 几何查询后端抽象层入口
+- `include/ray_query_backend_software.h`: 当前软件 BVH 查询实现
+- `include/ray_query_backend_embree.h`: Embree GPU 查询实现
+- `src/camera.cpp`: 相机姿态更新与 `CameraParams` 生成
 - `src/async_denoiser.cpp`: 异步 NPU 降噪流水线
 - `src/denoiser_openvino.cpp`: 内置 OpenVINO/NPU 降噪图
 - `src/perf_monitor.cpp`: 性能日志与 GPU/NPU 代理指标采样
 - `src/frame_processing.cpp`: 线性 RGB / 显示图像转换辅助函数
 - `src/bvh.cpp`: BVH 构建，当前使用分桶 SAH 划分
+- `src/scene.cpp`: Cornell Box 场景与测试模型装配
+- `src/loader.cpp`: 简化版 OBJ 加载器
+- `src/input.cpp`: SDL 输入事件到相机控制的桥接层
+- `src/denoise_demo.cpp`: 单帧渲染 + 同步 NPU 降噪的对比演示
+- `src/check_npu.cpp`: OpenVINO 设备探测小工具
+- `src/embree_probe.cpp`: Embree GPU 最小探针程序
 - `assets/`: 支持加载 `.obj` 3D 模型
+
+## 🛠️ 常见问题
+
+- 为什么相机一动画面就重新从噪点很多的状态开始？
+  - 因为路径追踪依赖“多帧累积平均”。
+  - 一旦视角变化，旧样本已经不对应当前画面，所以必须清空累积缓冲。
+
+- 为什么启用降噪后标题栏里会出现 `Lag`？
+  - 因为 NPU 是异步工作的。
+  - GPU 在继续渲染新帧时，显示端可能还在展示几帧前刚完成的降噪结果。
+
+- 为什么项目里有 `linear RGB` 和 `ARGB8888` 两种图像表示？
+  - `linear RGB` 更适合做降噪和数值计算。
+  - `ARGB8888` 是 SDL 更适合直接显示的 8 位整型格式。
+
+- 为什么 `renderer_sycl.cpp` 里有很多 clamp？
+  - 这些 clamp 不是为了“作假”，而是为了抑制路径追踪里少量极端离群样本。
+  - 对实时预览项目来说，稳定性通常比完全不设防更重要。
 
 ---
 *本项目作为从 CUDA 向 oneAPI 迁移的典型案例，展示了如何利用现代 C++ 释放移动端 SoC 的极致算力。*

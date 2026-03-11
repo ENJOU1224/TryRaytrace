@@ -28,6 +28,12 @@ void signal_handler(int) {
     g_quit = true;
 }
 
+// 这个演示程序的目标不是“交互式实时渲染”，而是“固定渲染一帧，然后肉眼对比降噪前后”。
+// 因此它会比主程序简单很多：
+// - 不处理相机移动
+// - 不做持续累积
+// - 只关心原图和降噪图切换展示
+
 /**
  * 将单帧累积缓冲区整理成线性 RGB。
  * 这里不做 Tone Mapping，目的是让降噪器吃到未经显示压缩的线性数据。
@@ -112,6 +118,7 @@ int main() {
                                              kDemoWidth,
                                              kDemoHeight);
 
+    // 场景初始化流程和主程序保持一致，这样演示结果才具有可比性。
     Scene scene = create_cornell_box();
     BVH bvh;
     bvh.build(scene.objects);
@@ -125,6 +132,7 @@ int main() {
     CameraController cam({50, 50, 295.6}, {0, 0, -1});
     CameraParams cam_params = cam.get_params(kDemoWidth, kDemoHeight);
 
+    // 这里只渲染一次，所以 frame seed 固定为 1。
     auto render_begin = std::chrono::high_resolution_clock::now();
     launch_render_kernel(accum, kDemoWidth, kDemoHeight, kDemoFrameSeed, 16, 8, cam_params, nullptr);
     auto render_end = std::chrono::high_resolution_clock::now();
@@ -136,6 +144,7 @@ int main() {
     build_linear_rgb_frame(accum, kDemoWidth * kDemoHeight, kDemoFrameSeed, raw_linear_rgb);
     linear_rgb_to_argb8888(raw_linear_rgb.data(), kDemoWidth * kDemoHeight, raw_pixels);
 
+    // 然后在 CPU/NPU 侧对这一帧做一次同步降噪。
     FrameDenoiser denoiser;
     denoiser.initialize(kDemoWidth, kDemoHeight);
 
@@ -190,6 +199,7 @@ int main() {
             }
         }
 
+        // 根据当前切换状态选择显示原始图还是降噪图。
         const std::vector<uint32_t>& active_pixels =
             (denoise_ready && show_denoised) ? denoised_pixels : raw_pixels;
         SDL_UpdateTexture(texture, nullptr, active_pixels.data(), kDemoWidth * sizeof(uint32_t));

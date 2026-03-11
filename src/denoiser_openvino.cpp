@@ -25,6 +25,9 @@ constexpr float kBlurWeight = 0.18f;
 constexpr float kFireflyGuardScale = 1.25f;
 constexpr float kFireflyGuardBias = 0.02f;
 
+// 这些常量控制的是“内置固定权重降噪图”的行为。
+// 可以把它理解成一个没有训练过程、完全手工写死的小网络配置。
+
 /**
  * 将 OpenVINO 设备列表中是否存在 NPU 的判断逻辑集中起来。
  * 这样主流程里只需要关心“能不能启用降噪”，不用重复处理字符串匹配。
@@ -110,6 +113,12 @@ std::vector<float> build_channel_scale(float value) {
 std::shared_ptr<ov::Model> build_builtin_denoise_model(int frame_height, int frame_width) {
     using namespace ov::opset13;
 
+    // Parameter 就是模型输入节点。
+    // 形状 [1, 3, H, W] 表示：
+    // - batch = 1
+    // - channel = 3 (RGB)
+    // - 高 H
+    // - 宽 W
     auto input = std::make_shared<Parameter>(ov::element::f32,
                                              ov::Shape{1, 3, static_cast<size_t>(frame_height), static_cast<size_t>(frame_width)});
 
@@ -118,6 +127,7 @@ std::shared_ptr<ov::Model> build_builtin_denoise_model(int frame_height, int fra
                                                    ov::Shape{3, 3, 5, 5},
                                                    blur_weights_data.data());
 
+    // 第一层卷积先做一次平滑，快速压掉最刺眼的高频噪点。
     auto blurred = std::make_shared<Convolution>(input->output(0),
                                                  blur_weights->output(0),
                                                  ov::Strides{1, 1},
@@ -137,8 +147,12 @@ std::shared_ptr<ov::Model> build_builtin_denoise_model(int frame_height, int fra
 
     auto firefly_limit_scaled = std::make_shared<Multiply>(blurred->output(0), firefly_scale->output(0));
     auto firefly_limit = std::make_shared<Add>(firefly_limit_scaled->output(0), firefly_bias->output(0));
+    // firefly guard:
+    // 如果某个像素远高于“模糊邻域推测值”，就把它压下来。
+    // 这一步是为了避免极端孤立亮点直接穿过整个网络。
     auto guarded = std::make_shared<Minimum>(input->output(0), firefly_limit->output(0));
 
+    // 第二层卷积在“已经做过高亮保护”的图上再细化一次。
     auto refined = std::make_shared<Convolution>(guarded->output(0),
                                                  blur_weights->output(0),
                                                  ov::Strides{1, 1},
@@ -158,6 +172,7 @@ std::shared_ptr<ov::Model> build_builtin_denoise_model(int frame_height, int fra
 
     auto preserved = std::make_shared<Multiply>(guarded->output(0), preserve_scale->output(0));
     auto refined_scaled = std::make_shared<Multiply>(refined->output(0), blur_scale->output(0));
+    // 最终不是完全用模糊结果，而是“原图主体 + 少量平滑修正”。
     auto output = std::make_shared<Add>(preserved->output(0), refined_scaled->output(0));
     output->get_output_tensor(0).set_names({"denoised_rgb"});
 
@@ -170,6 +185,7 @@ std::shared_ptr<ov::Model> build_builtin_denoise_model(int frame_height, int fra
  * 这里不做 Gamma，也不主动裁掉高亮，只过滤明显错误值。
  */
 void sanitize_rgb(std::vector<float>& buffer) {
+    // 这里的目标不是“把图像修漂亮”，而是“保证结果至少是合法数值”。
     for (float& value : buffer) {
         if (std::isnan(value) || std::isinf(value)) {
             value = 0.0f;
@@ -225,6 +241,7 @@ struct FrameDenoiser::Impl {
                 .set_layout("NHWC")
                 .set_element_type(ov::element::f32);
 
+            // build() 之后，模型里就已经包含了输入输出布局转换规则。
             model = ppp.build();
             compiled_model = core.compile_model(model, kDenoiseDeviceName);
             infer_request = compiled_model.create_infer_request();
@@ -262,6 +279,8 @@ struct FrameDenoiser::Impl {
         }
 
         try {
+            // 这里直接把外部连续内存“包装成” OpenVINO Tensor。
+            // 没有额外手写逐像素复制，接口层更简洁。
             ov::Tensor input_tensor(ov::element::f32,
                                     ov::Shape{1, static_cast<size_t>(height), static_cast<size_t>(width), 3},
                                     const_cast<float*>(input_rgb_nhwc));

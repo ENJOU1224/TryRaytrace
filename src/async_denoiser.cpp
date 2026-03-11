@@ -48,6 +48,9 @@ void AsyncFrameDenoiser::initialize(int frame_width, int frame_height) {
     result_buffers_[1].assign(static_cast<size_t>(width_) * height_ * 3, 0.0f);
 
     // 这里仍然复用同步版 FrameDenoiser，只是把它包进独立线程里。
+    // 也就是说：
+    // - 真正的 OpenVINO 推理逻辑没变
+    // - 变的只是“它在哪里执行”
     denoiser_.initialize(width_, height_);
     status_ = denoiser_.status();
     if (!denoiser_.is_enabled()) {
