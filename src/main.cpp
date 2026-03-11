@@ -1,9 +1,13 @@
 #include <csignal>
+#include <cstdio>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
-#include <vector>
 #include <atomic>
 #include <chrono>
-#include <memory>
+#include <string>
+#include <vector>
 #include <SDL2/SDL.h>
 #include <sycl/sycl.hpp>
 
@@ -37,6 +41,225 @@ namespace {
 constexpr bool kEnableNpuDenoiser = false;
 constexpr bool kEnableDiagnosticStats = false;
 constexpr int kProgressPrintInterval = 5;
+constexpr int kStaticPresentInterval = 2;
+constexpr int kPerfFlushInterval = 30;
+constexpr int kRenderTileWidth = 8;
+constexpr int kRenderTileHeight = 8;
+
+using Clock = std::chrono::steady_clock;
+
+struct StartupPerf {
+    double sdl_setup_ms = 0.0;
+    double scene_create_ms = 0.0;
+    double bvh_build_ms = 0.0;
+    double upload_ms = 0.0;
+    double denoiser_init_ms = 0.0;
+};
+
+struct DeviceMetrics {
+    double gt0_act_freq_mhz = -1.0;
+    double gt1_act_freq_mhz = -1.0;
+    double gt0_idle_delta_ms = -1.0;
+    double gt1_idle_delta_ms = -1.0;
+    double gt0_busy_pct = -1.0;
+    double gt1_busy_pct = -1.0;
+    double npu_busy_pct = -1.0;
+    double npu_freq_mhz = -1.0;
+    double npu_mem_bytes = -1.0;
+};
+
+class DeviceMetricsSampler {
+public:
+    DeviceMetricsSampler()
+        : gt0_act_freq_path_("/sys/devices/pci0000:00/0000:00:02.0/tile0/gt0/freq0/act_freq"),
+          gt1_act_freq_path_("/sys/devices/pci0000:00/0000:00:02.0/tile0/gt1/freq0/act_freq"),
+          gt0_idle_residency_path_("/sys/devices/pci0000:00/0000:00:02.0/tile0/gt0/gtidle/idle_residency_ms"),
+          gt1_idle_residency_path_("/sys/devices/pci0000:00/0000:00:02.0/tile0/gt1/gtidle/idle_residency_ms"),
+          npu_busy_time_path_("/sys/devices/pci0000:00/0000:00:0b.0/npu_busy_time_us"),
+          npu_freq_path_("/sys/devices/pci0000:00/0000:00:0b.0/npu_current_frequency_mhz"),
+          npu_mem_path_("/sys/devices/pci0000:00/0000:00:0b.0/npu_memory_utilization") {
+        previous_gt0_idle_ms_ = read_double(gt0_idle_residency_path_, -1.0);
+        previous_gt1_idle_ms_ = read_double(gt1_idle_residency_path_, -1.0);
+        previous_npu_busy_us_ = read_double(npu_busy_time_path_, -1.0);
+    }
+
+    DeviceMetrics sample(double frame_ms) {
+        DeviceMetrics metrics;
+        metrics.gt0_act_freq_mhz = read_double(gt0_act_freq_path_, -1.0);
+        metrics.gt1_act_freq_mhz = read_double(gt1_act_freq_path_, -1.0);
+        metrics.npu_freq_mhz = read_double(npu_freq_path_, -1.0);
+        metrics.npu_mem_bytes = read_double(npu_mem_path_, -1.0);
+
+        const double current_gt0_idle_ms = read_double(gt0_idle_residency_path_, -1.0);
+        const double current_gt1_idle_ms = read_double(gt1_idle_residency_path_, -1.0);
+        const double current_npu_busy_us = read_double(npu_busy_time_path_, -1.0);
+
+        metrics.gt0_idle_delta_ms = compute_delta(current_gt0_idle_ms, previous_gt0_idle_ms_);
+        metrics.gt1_idle_delta_ms = compute_delta(current_gt1_idle_ms, previous_gt1_idle_ms_);
+        metrics.gt0_busy_pct = estimate_busy_pct(frame_ms, metrics.gt0_idle_delta_ms);
+        metrics.gt1_busy_pct = estimate_busy_pct(frame_ms, metrics.gt1_idle_delta_ms);
+
+        const double npu_busy_delta_us = compute_delta(current_npu_busy_us, previous_npu_busy_us_);
+        if (npu_busy_delta_us >= 0.0 && frame_ms > 0.0) {
+            metrics.npu_busy_pct = std::clamp((npu_busy_delta_us / (frame_ms * 1000.0)) * 100.0, 0.0, 100.0);
+        }
+
+        previous_gt0_idle_ms_ = current_gt0_idle_ms;
+        previous_gt1_idle_ms_ = current_gt1_idle_ms;
+        previous_npu_busy_us_ = current_npu_busy_us;
+        return metrics;
+    }
+
+private:
+    static double read_double(const char* path, double fallback) {
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            return fallback;
+        }
+
+        double value = fallback;
+        file >> value;
+        return file.fail() ? fallback : value;
+    }
+
+    static double compute_delta(double current, double previous) {
+        if (current < 0.0 || previous < 0.0) {
+            return -1.0;
+        }
+        double delta = current - previous;
+        return delta >= 0.0 ? delta : -1.0;
+    }
+
+    static double estimate_busy_pct(double frame_ms, double idle_delta_ms) {
+        if (frame_ms <= 0.0 || idle_delta_ms < 0.0) {
+            return -1.0;
+        }
+        return std::clamp((1.0 - idle_delta_ms / frame_ms) * 100.0, 0.0, 100.0);
+    }
+
+    const char* gt0_act_freq_path_;
+    const char* gt1_act_freq_path_;
+    const char* gt0_idle_residency_path_;
+    const char* gt1_idle_residency_path_;
+    const char* npu_busy_time_path_;
+    const char* npu_freq_path_;
+    const char* npu_mem_path_;
+
+    double previous_gt0_idle_ms_ = -1.0;
+    double previous_gt1_idle_ms_ = -1.0;
+    double previous_npu_busy_us_ = -1.0;
+};
+
+std::string make_timestamp() {
+    std::time_t now = std::time(nullptr);
+    std::tm* tm = std::localtime(&now);
+    char buffer[64];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d_%H-%M-%S", tm);
+    return buffer;
+}
+
+double elapsed_ms(const Clock::time_point& begin, const Clock::time_point& end) {
+    return std::chrono::duration<double, std::milli>(end - begin).count();
+}
+
+/**
+ * 运行时性能日志。
+ *
+ * 目标不是做复杂 profiling，而是稳定记录主循环各阶段开销。
+ * 这样用户跑完之后，我们可以直接看：
+ * 1. GPU kernel 是否是绝对瓶颈；
+ * 2. CPU 后处理 / SDL 提交是否吞掉了太多时间；
+ * 3. 在开启降噪时，NPU 推理到底占了多少比例。
+ */
+class PerfLogger {
+public:
+    explicit PerfLogger(const StartupPerf& startup) {
+        std::error_code ec;
+        std::filesystem::create_directories("logs", ec);
+        if (ec) {
+            std::cerr << "[Perf] Failed to create logs directory: " << ec.message() << std::endl;
+            return;
+        }
+
+        path_ = "logs/perf_" + make_timestamp() + ".csv";
+        file_ = std::fopen(path_.c_str(), "w");
+        if (!file_) {
+            std::cerr << "[Perf] Failed to open log file: " << path_ << std::endl;
+            return;
+        }
+
+        std::fprintf(file_, "# sdl_setup_ms=%.3f\n", startup.sdl_setup_ms);
+        std::fprintf(file_, "# scene_create_ms=%.3f\n", startup.scene_create_ms);
+        std::fprintf(file_, "# bvh_build_ms=%.3f\n", startup.bvh_build_ms);
+        std::fprintf(file_, "# upload_ms=%.3f\n", startup.upload_ms);
+        std::fprintf(file_, "# denoiser_init_ms=%.3f\n", startup.denoiser_init_ms);
+        std::fprintf(file_,
+                     "frame,presented,camera_moved,save_request,input_ms,render_ms,post_ms,present_ms,denoise_ms,total_ms,fps,"
+                     "gt0_act_freq_mhz,gt1_act_freq_mhz,gt0_idle_delta_ms,gt1_idle_delta_ms,gt0_busy_pct,gt1_busy_pct,"
+                     "npu_busy_pct,npu_freq_mhz,npu_mem_bytes\n");
+        std::fflush(file_);
+
+        std::cout << "[Perf] Logging frame timings to " << path_ << std::endl;
+    }
+
+    ~PerfLogger() {
+        if (file_) {
+            std::fflush(file_);
+            std::fclose(file_);
+        }
+    }
+
+    void log_frame(int frame_index,
+                   bool presented,
+                   bool camera_moved,
+                   bool save_request,
+                   double input_ms,
+                   double render_ms,
+                   double post_ms,
+                   double present_ms,
+                   double denoise_ms,
+                   double total_ms,
+                   double fps,
+                   const DeviceMetrics& device_metrics) {
+        if (!file_) {
+            return;
+        }
+
+        std::fprintf(file_,
+                     "%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,%.3f,%.3f,%.2f,%.2f,%.2f,%.1f,%.0f\n",
+                     frame_index,
+                     presented ? 1 : 0,
+                     camera_moved ? 1 : 0,
+                     save_request ? 1 : 0,
+                     input_ms,
+                     render_ms,
+                     post_ms,
+                     present_ms,
+                     denoise_ms,
+                     total_ms,
+                     fps,
+                     device_metrics.gt0_act_freq_mhz,
+                     device_metrics.gt1_act_freq_mhz,
+                     device_metrics.gt0_idle_delta_ms,
+                     device_metrics.gt1_idle_delta_ms,
+                     device_metrics.gt0_busy_pct,
+                     device_metrics.gt1_busy_pct,
+                     device_metrics.npu_busy_pct,
+                     device_metrics.npu_freq_mhz,
+                     device_metrics.npu_mem_bytes);
+
+        ++pending_rows_;
+        if (pending_rows_ >= kPerfFlushInterval) {
+            std::fflush(file_);
+            pending_rows_ = 0;
+        }
+    }
+
+private:
+    FILE* file_ = nullptr;
+    std::string path_;
+    int pending_rows_ = 0;
+};
 
 float milli_to_float(uint32_t milli_value) {
     return static_cast<float>(milli_value) / 1000.0f;
@@ -124,11 +347,14 @@ int main(int argc, char** argv) {
     // 注册信号处理，支持 Ctrl+C 安全退出
     std::signal(SIGINT, signal_handler);
 
+    StartupPerf startup_perf;
+
     // 1. 系统参数配置
     const int w = 1200;
     const int h = 800;  
     
     // 初始化 SDL2 视频子系统
+    auto sdl_begin = Clock::now();
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         std::cerr << "[SDL Error] Initialization failed: " << SDL_GetError() << std::endl;
         return 1;
@@ -141,14 +367,19 @@ int main(int argc, char** argv) {
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, 
                                              SDL_TEXTUREACCESS_STREAMING, w, h);
+    startup_perf.sdl_setup_ms = elapsed_ms(sdl_begin, Clock::now());
 
     // 2. 场景与渲染引擎初始化
     // 创建场景数据 (Cornell Box + OBJ Models)
+    auto scene_begin = Clock::now();
     Scene scene = create_cornell_box();
+    startup_perf.scene_create_ms = elapsed_ms(scene_begin, Clock::now());
     
     // 构建 BVH 加速结构 (线性化处理)
+    auto bvh_begin = Clock::now();
     BVH bvh; 
     bvh.build(scene.objects);
+    startup_perf.bvh_build_ms = elapsed_ms(bvh_begin, Clock::now());
 
     // 筛选光源索引 (用于 NEE 显式采样优化)
     std::vector<int> light_indices;
@@ -159,7 +390,9 @@ int main(int argc, char** argv) {
     }
 
     // 初始化 SYCL 渲染核心并上传数据到 USM (统一内存)
+    auto upload_begin = Clock::now();
     init_scene_data(scene.objects, scene.texture_files, bvh.get_nodes(), light_indices);
+    startup_perf.upload_ms = elapsed_ms(upload_begin, Clock::now());
 
     // 初始化相机控制器 (第一人称视角)
     CameraController cam({50, 50, 295.6}, {0, 0, -1});
@@ -188,6 +421,7 @@ int main(int argc, char** argv) {
 
     FrameDenoiser denoiser;
     std::string last_denoiser_status;
+    auto denoiser_begin = Clock::now();
     if (kEnableNpuDenoiser) {
         denoiser.initialize(w, h);
         last_denoiser_status = denoiser.status();
@@ -197,6 +431,10 @@ int main(int argc, char** argv) {
     if (!last_denoiser_status.empty()) {
         std::cout << last_denoiser_status << std::endl;
     }
+    startup_perf.denoiser_init_ms = elapsed_ms(denoiser_begin, Clock::now());
+
+    PerfLogger perf_logger(startup_perf);
+    DeviceMetricsSampler device_metrics_sampler;
 
     InputManager input; 
     int gpu_frame = 1;
@@ -204,13 +442,18 @@ int main(int argc, char** argv) {
     // FPS 与性能统计
     auto last_time = std::chrono::high_resolution_clock::now();
     float fps = 0.0f;
+    bool frame_presented = false;
 
     // ------------------------------------------------------------------
     // 4. 实时渲染主循环
     // ------------------------------------------------------------------
     while (!quit) {
+        auto frame_begin = Clock::now();
+
         // [A] 处理用户输入
+        auto input_begin = Clock::now();
         InputState state = input.process_events(cam);
+        auto input_end = Clock::now();
         
         // 保存当前快照
         if (state.save_request) {
@@ -233,48 +476,88 @@ int main(int argc, char** argv) {
         if (render_stats) {
             *render_stats = {};
         }
-        launch_render_kernel(d_accum, w, h, gpu_frame, 16, 8, cam_params, render_stats);
+        auto render_begin = Clock::now();
+        launch_render_kernel(d_accum, w, h, gpu_frame, kRenderTileWidth, kRenderTileHeight, cam_params, render_stats);
+        auto render_end = Clock::now();
         
-        // [C] 图像后处理与 NPU 降噪
-        if (kEnableNpuDenoiser) {
-            build_linear_rgb_frame(d_accum, w * h, gpu_frame, linear_rgb_frame);
+        // [C] 图像后处理与屏幕提交
+        // 渲染帧数增长时，没有必要每一帧都做一次整屏 CPU 转换和 SDL 提交。
+        // 静止观察时隔帧显示，能显著减少主循环的 CPU 开销，同时不影响采样累积。
+        const bool force_present = state.camera_moved || (gpu_frame <= 2);
+        const bool should_present = force_present || (gpu_frame % kStaticPresentInterval == 0);
+        frame_presented = false;
+        double post_ms = 0.0;
+        double present_ms = 0.0;
+        double denoise_ms = 0.0;
 
-            if (denoiser.should_run(gpu_frame) &&
-                !denoiser.run(linear_rgb_frame.data(), w, h)) {
-                if (denoiser.status() != last_denoiser_status) {
-                    std::cout << denoiser.status() << std::endl;
-                    last_denoiser_status = denoiser.status();
-                }
-            }
+        if (should_present) {
+            auto post_begin = Clock::now();
+            if (kEnableNpuDenoiser) {
+                build_linear_rgb_frame(d_accum, w * h, gpu_frame, linear_rgb_frame);
 
-            const float* active_rgb = linear_rgb_frame.data();
-            if (denoiser.has_output()) {
-                const float alpha = denoiser.blend_alpha(gpu_frame);
-                if (alpha > 0.0f) {
-                    blend_linear_rgb(linear_rgb_frame.data(),
-                                     denoiser.output_rgb().data(),
-                                     alpha,
-                                     w * h,
-                                     blended_rgb_frame);
-                    active_rgb = blended_rgb_frame.data();
+                if (denoiser.should_run(gpu_frame)) {
+                    auto denoise_begin_frame = Clock::now();
+                    bool denoise_ok = denoiser.run(linear_rgb_frame.data(), w, h);
+                    denoise_ms = elapsed_ms(denoise_begin_frame, Clock::now());
+                    if (!denoise_ok) {
+                        if (denoiser.status() != last_denoiser_status) {
+                            std::cout << denoiser.status() << std::endl;
+                            last_denoiser_status = denoiser.status();
+                        }
+                    }
                 }
+
+                const float* active_rgb = linear_rgb_frame.data();
+                if (denoiser.has_output()) {
+                    const float alpha = denoiser.blend_alpha(gpu_frame);
+                    if (alpha > 0.0f) {
+                        blend_linear_rgb(linear_rgb_frame.data(),
+                                         denoiser.output_rgb().data(),
+                                         alpha,
+                                         w * h,
+                                         blended_rgb_frame);
+                        active_rgb = blended_rgb_frame.data();
+                    }
+                }
+                linear_rgb_to_argb8888(active_rgb, w * h, pixel_buffer.data());
+            } else {
+                accum_to_argb8888(d_accum, w * h, gpu_frame, pixel_buffer.data());
             }
-            linear_rgb_to_argb8888(active_rgb, w * h, pixel_buffer.data());
-        } else {
-            accum_to_argb8888(d_accum, w * h, gpu_frame, pixel_buffer.data());
+            auto post_end = Clock::now();
+            post_ms = elapsed_ms(post_begin, post_end);
+
+            // [D] 更新 SDL 屏幕
+            auto present_begin = Clock::now();
+            SDL_UpdateTexture(texture, NULL, pixel_buffer.data(), w * sizeof(uint32_t));
+            SDL_RenderClear(renderer);
+            SDL_RenderCopy(renderer, texture, NULL, NULL);
+            SDL_RenderPresent(renderer);
+            auto present_end = Clock::now();
+            present_ms = elapsed_ms(present_begin, present_end);
+            frame_presented = true;
         }
-
-        // [D] 更新 SDL 屏幕
-        SDL_UpdateTexture(texture, NULL, pixel_buffer.data(), w * sizeof(uint32_t));
-        SDL_RenderClear(renderer);
-        SDL_RenderCopy(renderer, texture, NULL, NULL);
-        SDL_RenderPresent(renderer);
         
         // [E] 性能统计与反馈
         auto current_time = std::chrono::high_resolution_clock::now();
         std::chrono::duration<float> delta = current_time - last_time;
         last_time = current_time;
         fps = 0.9f * fps + 0.1f * (1.0f / delta.count()); 
+        auto frame_end = Clock::now();
+        const double total_frame_ms = elapsed_ms(frame_begin, frame_end);
+        const DeviceMetrics device_metrics = device_metrics_sampler.sample(total_frame_ms);
+
+        perf_logger.log_frame(gpu_frame,
+                              frame_presented,
+                              state.camera_moved,
+                              state.save_request,
+                              elapsed_ms(input_begin, input_end),
+                              elapsed_ms(render_begin, render_end),
+                              post_ms,
+                              present_ms,
+                              denoise_ms,
+                              total_frame_ms,
+                              fps,
+                              device_metrics);
 
         if (gpu_frame % kProgressPrintInterval == 0) {
             char title[256];
@@ -308,7 +591,7 @@ int main(int argc, char** argv) {
                        milli_to_float(render_stats->max_final_color_lum_milli));
                 fflush(stdout);
             } else {
-                printf("\r>> [SYCL] Frame %d | FPS: %.1f", gpu_frame, fps);
+                printf("\r>> [SYCL] Frame %d | FPS: %.1f | Present: %s", gpu_frame, fps, frame_presented ? "yes" : "skip");
                 fflush(stdout);
             }
         }

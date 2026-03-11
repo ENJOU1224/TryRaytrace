@@ -31,6 +31,9 @@ constexpr float kThroughputMaxComponent = 4.0f;
 constexpr float kFinalFireflyLumLimit = 2.0f;
 constexpr bool kApplyFinalFireflyClamp = true;
 constexpr float kRayEpsilon = 0.001f;
+constexpr int kMaxPathDepth = 5;
+constexpr int kRussianRouletteStartDepth = 3;
+constexpr int kMaxNeeDepth = 2;
 
 struct SceneHit {
     float t = 1e20f;
@@ -346,10 +349,9 @@ HOST_DEVICE Vec trace(Vec r_o,
                       RenderStats* stats) {
     Vec radiance = {0, 0, 0};
     Vec throughput = {1, 1, 1};
-    const int MAX_DEPTH = 10;
     bool prev_was_specular = true; // 默认 true 以捕捉直接入眼的光
 
-    for (int depth = 0; depth < MAX_DEPTH; depth++) {
+    for (int depth = 0; depth < kMaxPathDepth; depth++) {
         SceneHit hit = find_closest_hit(r_o, r_d, bvh_nodes, scene_objects);
 
         // 光线逸出场景
@@ -422,7 +424,7 @@ HOST_DEVICE Vec trace(Vec r_o,
         else {
             // --- 漫反射分支 (Diffuse + NEE) ---
             // NEE: 直接采样光源
-            if (l_count > 0 && depth < 3) {
+            if (l_count > 0 && depth < kMaxNeeDepth) {
                 const Object& light = scene_objects[light_indices[(int)(rng.next_float() * l_count)]];
                 LightSample light_sample = sample_light(light, x_hit, nl, rng);
                 if (light_sample.valid &&
@@ -451,7 +453,7 @@ HOST_DEVICE Vec trace(Vec r_o,
         }
 
         // [5] 俄罗斯轮盘赌 (RR)
-        if (depth > 3) {
+        if (depth >= kRussianRouletteStartDepth) {
             float p = albedo.x > albedo.y ? (albedo.x > albedo.z ? albedo.x : albedo.z) : (albedo.y > albedo.z ? albedo.y : albedo.z);
             if (p < 0.1f) p = 0.1f;
             if (rng.next_float() > p) break;
